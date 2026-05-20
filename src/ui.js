@@ -7,6 +7,7 @@ export const BTN = {
   LOGOUT_DRIVER: '🚪 Выйти из водителей',
   HELP: '❓ Помощь',
   FINISH_ORDER: '🏁 Завершить заказ',
+  CANCEL_FORM: '❌ Отменить',
 };
 
 const MENU_TEXTS = new Set(Object.values(BTN));
@@ -46,6 +47,7 @@ export function uiActionFromMessage(text, payloadRaw) {
   if (t === BTN.EDIT_DRIVER) return 'edit_driver';
   if (t === BTN.LOGOUT_DRIVER) return 'logout_driver';
   if (t === BTN.FINISH_ORDER) return 'finish_order';
+  if (t === BTN.CANCEL_FORM) return 'cancel_form';
   return null;
 }
 
@@ -66,13 +68,21 @@ export function msgOrderSearching(orderId) {
   ].join('\n');
 }
 
-export function msgOrderOffer(orderId) {
+export function msgPassengerOffer(orderId, offerLine) {
   return [
     `🆔 Заказ #${orderId}`,
     '',
-    'Водитель ответил — посмотрите сообщение выше.',
-    'Нажмите «Да, едем» или «Отмена» под предложением.',
+    offerLine,
+    '',
+    'Нажмите «Да, едем» или «Отмена».',
   ].join('\n');
+}
+
+export function msgPassengerOfferResolved(orderId, accepted) {
+  if (accepted) {
+    return [`🆔 Заказ #${orderId}`, '', '✅ Вы подтвердили поездку.'].join('\n');
+  }
+  return [`🆔 Заказ #${orderId}`, '', '❌ Вы отменили заказ.'].join('\n');
 }
 
 export function msgOrderTrip(orderId, callsign) {
@@ -118,14 +128,6 @@ export function msgDriverUseDmAfterTake(orderId, callsign) {
     'В беседе водителей новые сообщения пассажиру не уходят.',
     '',
     'Ожидайте подтверждения «Да, едем» от пассажира.',
-  ].join('\n');
-}
-
-export function msgDriverUseDmCustomReply(orderId) {
-  return [
-    `Заказ #${orderId}`,
-    '',
-    'Напишите ответ пассажиру одним сообщением в этом диалоге с ботом (не в беседе водителей).',
   ].join('\n');
 }
 
@@ -180,11 +182,11 @@ export function helpTextCommunity(isRegisteredDriver, callsign, phase = 'idle') 
     lines.push('💬 Вы в диалоге с водителем — пишите сюда.');
     lines.push('🏁 Завершить поездку может только водитель.');
   } else if (isRegisteredDriver) {
-    lines.push('🚗 Вы водитель — заказы в беседе водителей (кнопки ~3-5 / ~10 / Ответить).');
+    lines.push('🚗 Вы водитель — заказы в беседе водителей (кнопки ~3-5 / ~10 / ~20 мин).');
     lines.push('Переписка с пассажиром и завершение поездки — в личке с ботом.');
     lines.push('«👤 Профиль водителя» — позывной и выход из водителей.');
   } else {
-    lines.push('👤 Пассажир: «🚕 Заказать такси» → маршрут.');
+    lines.push('👤 Пассажир: «🚕 Заказать такси» → форма (откуда / куда / комментарий).');
     lines.push('🚗 Водитель: «🚗 Я водитель» и позывной.');
     lines.push('В беседе водителей — принять заказ кнопкой.');
     lines.push('Переписка с пассажиром — в личке с ботом.');
@@ -201,7 +203,7 @@ export function helpTextDriversChat(isRegisteredDriver, callsign) {
   const lines = [
     '🚕 Беседа водителей',
     '',
-    '• Новый заказ — кнопки «~ 3-5 мин», «~ 10 мин», «✏️ Ответить».',
+    '• Новый заказ — кнопки «~ 3-5 мин», «~ 10 мин», «~ 20 мин».',
     '• После взятия заказа здесь только обновится статус — кто взял.',
     '• Переписка с пассажиром — в личных сообщениях бота.',
     '• Завершить поездку водитель может только в личке с ботом.',

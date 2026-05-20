@@ -25,6 +25,7 @@ export function openDb(databasePath) {
       status TEXT NOT NULL,
       driver_user_id INTEGER,
       drivers_chat_message_id INTEGER,
+      passenger_offer_message_id INTEGER,
       order_text TEXT NOT NULL,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
@@ -38,6 +39,22 @@ export function openDb(databasePath) {
       mode TEXT NOT NULL DEFAULT 'idle',
       context_order_id INTEGER
     );
+
+    CREATE TABLE IF NOT EXISTS order_drafts (
+      user_id INTEGER PRIMARY KEY NOT NULL,
+      step TEXT NOT NULL,
+      from_address TEXT,
+      from_building TEXT,
+      to_address TEXT,
+      to_building TEXT,
+      comment TEXT,
+      peer_id INTEGER
+    );
   `);
+  try {
+    db.exec('ALTER TABLE orders ADD COLUMN passenger_offer_message_id INTEGER');
+  } catch {
+    // колонка уже есть
+  }
   return db;
 }

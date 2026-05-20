@@ -122,6 +122,18 @@ export function driverProfileKeyboard() {
   });
 }
 
+/** Заполнение формы заказа. */
+export function passengerOrderFormKeyboard() {
+  return JSON.stringify({
+    one_time: false,
+    inline: false,
+    buttons: [
+      [textBtn(BTN.CANCEL_FORM, { cmd: 'cancel_form' }, 'negative')],
+      [textBtn(BTN.HELP, { cmd: 'help' }, 'secondary')],
+    ],
+  });
+}
+
 /** Пассажир с активным заказом — только помощь, без завершения заказа. */
 export function passengerDuringOrderKeyboard() {
   return JSON.stringify({
@@ -167,8 +179,8 @@ export function driversOrderKeyboard(orderId) {
       [
         callbackBtn('~ 3-5 мин', { a: 'eta', o: orderId, t: '3' }, 'positive'),
         callbackBtn('~ 10 мин', { a: 'eta', o: orderId, t: '10' }, 'primary'),
+        callbackBtn('~ 20 мин', { a: 'eta', o: orderId, t: '20' }, 'secondary'),
       ],
-      [callbackBtn('✏️ Ответить', { a: 'reply', o: orderId }, 'secondary')],
     ],
   });
 }

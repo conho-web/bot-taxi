@@ -8,11 +8,11 @@ import {
   msgDriverProfile,
   msgDriverTripDm,
   msgDriverUseDmAfterTake,
-  msgDriverUseDmCustomReply,
   msgDriversChatTaken,
   msgOrderCancelled,
   msgOrderFinished,
-  msgOrderOffer,
+  msgPassengerOffer,
+  msgPassengerOfferResolved,
   msgOrderSearching,
   msgOrderTrip,
   ORDER_STATUS,
@@ -34,16 +34,26 @@ import {
   passengerConfirmKeyboard,
   passengerDuringOrderKeyboard,
   passengerIdleKeyboard,
+  passengerOrderFormKeyboard,
   registeredDriverKeyboard,
   driverProfileKeyboard,
   randomId,
   userPeerForSend,
   vkMethod,
 } from './vk.js';
+import {
+  draftFieldForStep,
+  formatOrderText,
+  FORM_STEP,
+  isSkipComment,
+  msgOrderFormPanel,
+  nextStep,
+} from './orderForm.js';
 
 const ETA_TEXT = {
   3: 'примерно через 3–5 минут',
   10: 'примерно через 10 минут',
+  20: 'примерно через 20 минут',
 };
 
 
@@ -66,6 +76,9 @@ export function createWebhookRouter(db) {
 
   const updateOrderMessageId = db.prepare(
     'UPDATE orders SET drivers_chat_message_id = ?, updated_at = ? WHERE id = ?',
+  );
+  const updatePassengerOfferMessageId = db.prepare(
+    'UPDATE orders SET passenger_offer_message_id = ?, updated_at = ? WHERE id = ?',
   );
 
   const getOrder = db.prepare('SELECT * FROM orders WHERE id = ?');
@@ -100,6 +113,25 @@ export function createWebhookRouter(db) {
   `);
   const clearSession = db.prepare('DELETE FROM driver_sessions WHERE user_id = ?');
 
+  const getOrderDraft = db.prepare('SELECT * FROM order_drafts WHERE user_id = ?');
+  const upsertOrderDraft = db.prepare(`
+    INSERT INTO order_drafts (
+      user_id, step, from_address, from_building, to_address, to_building, comment, peer_id
+    )
+    VALUES (
+      @user_id, @step, @from_address, @from_building, @to_address, @to_building, @comment, @peer_id
+    )
+    ON CONFLICT(user_id) DO UPDATE SET
+      step = excluded.step,
+      from_address = excluded.from_address,
+      from_building = excluded.from_building,
+      to_address = excluded.to_address,
+      to_building = excluded.to_building,
+      comment = excluded.comment,
+      peer_id = excluded.peer_id
+  `);
+  const clearOrderDraft = db.prepare('DELETE FROM order_drafts WHERE user_id = ?');
+
   const activeOrderForPassenger = db.prepare(`
     SELECT * FROM orders
     WHERE passenger_user_id = ? AND status IN ('new', 'pending_passenger', 'confirmed')
@@ -122,30 +154,190 @@ export function createWebhookRouter(db) {
   }
 
   async function sendDriverDm(driverUserId, text, extra = {}) {
-    await sendPeer(userPeerForSend(driverUserId), text, extra);
+    const driverOrder = activeOrderForDriver.get(driverUserId);
+    let keyboard = extra.keyboard;
+    // Во время поездки всегда оставляем «Завершить заказ» (новое сообщение без неё сбивает клавиатуру в ВК)
+    if (driverOrder?.status === ORDER_STATUS.CONFIRMED) {
+      keyboard = driverTripKeyboard();
+    } else if (!keyboard) {
+      keyboard = dmKeyboardForUser(driverUserId, { order: driverOrder });
+    }
+    await sendPeer(userPeerForSend(driverUserId), text, {
+      keyboard,
+      random_id: randomId(),
+    });
+  }
+
+  /** Главное меню, когда нет заказа, формы и активной поездки. */
+  function idleMenuKeyboard(userId) {
+    if (userId && getDriver.get(userId)) return registeredDriverKeyboard();
+    return passengerIdleKeyboard();
   }
 
   function passengerKeyboard(userId, order) {
     const phase = passengerPhase(order);
-    if (phase === 'idle' && userId && getDriver.get(userId)) {
-      return registeredDriverKeyboard();
-    }
-    if (phase === 'idle') return passengerIdleKeyboard();
+    if (phase === 'idle') return idleMenuKeyboard(userId);
     return passengerDuringOrderKeyboard();
   }
 
   function driverDmKeyboard(order) {
-    if (!order) return driverProfileKeyboard();
+    if (!order) return registeredDriverKeyboard();
     if (order.status === ORDER_STATUS.CONFIRMED) return driverTripKeyboard();
     if (order.status === ORDER_STATUS.PENDING) return driverPendingKeyboard();
-    return driverProfileKeyboard();
+    return registeredDriverKeyboard();
   }
 
-  async function sendToPassenger(peerId, userId, text, order = null) {
+  function isUserDmIdle(userId) {
+    if (activeOrderForPassenger.get(userId)) return false;
+    if (activeOrderForDriver.get(userId)) return false;
+    if (getOrderDraft.get(userId)) return false;
+    const session = getSession.get(userId);
+    if (session?.mode === 'register_callsign') return false;
+    return true;
+  }
+
+  function dmKeyboardForUser(userId, { order = null, override = null } = {}) {
+    if (override) return override;
+    if (getOrderDraft.get(userId)) return passengerOrderFormKeyboard();
+    const session = getSession.get(userId);
+    if (session?.mode === 'register_callsign') return passengerIdleKeyboard();
+    const passengerOrder = order ?? activeOrderForPassenger.get(userId);
+    if (passengerOrder) return passengerKeyboard(userId, passengerOrder);
+    const driverOrder = activeOrderForDriver.get(userId);
+    if (driverOrder) return driverDmKeyboard(driverOrder);
+    return idleMenuKeyboard(userId);
+  }
+
+  async function sendToPassenger(peerId, userId, text, order = null, keyboardOverride) {
     await sendPeer(peerId, text, {
-      keyboard: passengerKeyboard(userId, order),
-      ...{},
+      keyboard: dmKeyboardForUser(userId, { order, override: keyboardOverride }),
+      random_id: randomId(),
     });
+  }
+
+  async function sendIdleMenu(peerId, userId, text) {
+    await sendToPassenger(peerId, userId, text, null, idleMenuKeyboard(userId));
+  }
+
+  function hasOrderDraft(userId) {
+    return !!getOrderDraft.get(userId);
+  }
+
+  async function startOrderForm(peerId, userId) {
+    upsertOrderDraft.run({
+      user_id: userId,
+      step: FORM_STEP.FROM_ADDRESS,
+      from_address: null,
+      from_building: null,
+      to_address: null,
+      to_building: null,
+      comment: null,
+      peer_id: peerId,
+    });
+    const draft = getOrderDraft.get(userId);
+    await sendToPassenger(
+      peerId,
+      userId,
+      msgOrderFormPanel(draft, FORM_STEP.FROM_ADDRESS),
+      null,
+      passengerOrderFormKeyboard(),
+    );
+  }
+
+  async function cancelOrderForm(peerId, userId) {
+    clearOrderDraft.run(userId);
+    await sendIdleMenu(
+      peerId,
+      userId,
+      'Оформление заказа отменено. Выберите действие кнопкой ниже.',
+    );
+  }
+
+  async function submitOrderFromDraft(peerId, userId, draft) {
+    const now = Math.floor(Date.now() / 1000);
+    const orderText = formatOrderText(draft);
+    const info = insertOrder.run({
+      passenger_peer_id: peerId,
+      passenger_user_id: userId,
+      order_text: orderText,
+      created_at: now,
+      updated_at: now,
+    });
+    clearOrderDraft.run(userId);
+
+    const orderId = Number(info.lastInsertRowid);
+    const order = getOrder.get(orderId);
+    try {
+      await postOrderToDrivers(order);
+      await sendToPassenger(peerId, userId, msgOrderSearching(orderId), order);
+    } catch (e) {
+      console.error('[order] не удалось отправить в беседу водителей:', e.message, {
+        driversPeerId: config.driversPeerId,
+        vk: e.vk,
+      });
+      await sendToPassenger(
+        peerId,
+        userId,
+        `Заказ #${orderId} сохранён, но не удалось опубликовать водителям. Проверьте DRIVERS_PEER_ID и что бот в беседе.`,
+        order,
+      );
+    }
+  }
+
+  async function handleOrderFormInput(peerId, userId, text) {
+    const draft = getOrderDraft.get(userId);
+    if (!draft) return false;
+
+    const step = draft.step;
+    const field = draftFieldForStep(step);
+    if (!field) {
+      clearOrderDraft.run(userId);
+      return false;
+    }
+
+    let value = text;
+    if (step === FORM_STEP.COMMENT && isSkipComment(text)) {
+      value = '';
+    } else if (!(value || '').trim()) {
+      await sendToPassenger(
+        peerId,
+        userId,
+        'Введите значение или нажмите «❌ Отменить».',
+        null,
+        passengerOrderFormKeyboard(),
+      );
+      return true;
+    }
+
+    const updated = {
+      user_id: userId,
+      step,
+      from_address: draft.from_address,
+      from_building: draft.from_building,
+      to_address: draft.to_address,
+      to_building: draft.to_building,
+      comment: draft.comment,
+      peer_id: draft.peer_id ?? peerId,
+    };
+    updated[field] = (value || '').trim();
+
+    const next = nextStep(step);
+    if (!next) {
+      await submitOrderFromDraft(peerId, userId, updated);
+      return true;
+    }
+
+    updated.step = next;
+    upsertOrderDraft.run(updated);
+    const fresh = getOrderDraft.get(userId);
+    await sendToPassenger(
+      peerId,
+      userId,
+      msgOrderFormPanel(fresh, next),
+      null,
+      passengerOrderFormKeyboard(),
+    );
+    return true;
   }
 
   /** @deprecated */
@@ -196,24 +388,12 @@ export function createWebhookRouter(db) {
     setOrderCompleted.run(now, fresh.id);
     clearSession.run(driverUserId);
 
-    const driver = getDriver.get(driverUserId);
-    const tag = driver?.callsign ?? 'Водитель';
-
-    await editDriversOrderMessage(
-      fresh,
-      `✅ Заказ #${fresh.id} завершён — ${tag}.`,
-      EMPTY_INLINE_KEYBOARD,
-    );
-
-    await sendToPassenger(
+    await sendIdleMenu(
       fresh.passenger_peer_id,
       fresh.passenger_user_id,
       msgOrderFinished(fresh.id),
-      null,
     );
-    await sendDriverDm(driverUserId, msgDriverFinishOrder(fresh.id), {
-      keyboard: registeredDriverKeyboard(),
-    });
+    await sendDriverDm(driverUserId, msgDriverFinishOrder(fresh.id));
   }
 
   async function replyHelpDriversChat(userId) {
@@ -266,7 +446,7 @@ export function createWebhookRouter(db) {
     const text =
       `🆕 Заказ #${order.id}\n` +
       `📝 ${order.order_text}\n\n` +
-      `Нажмите кнопку, чтобы ответить пассажиру.`;
+      `Нажмите кнопку, чтобы принять заказ.`;
 
     const messageId = await vkMethod('messages.send', {
       peer_id: config.driversPeerId,
@@ -294,6 +474,55 @@ export function createWebhookRouter(db) {
     };
     if (keyboard !== undefined) params.keyboard = keyboard;
     await vkMethod('messages.edit', params);
+  }
+
+  async function sendPassengerOffer(order, offerLine) {
+    const text = msgPassengerOffer(order.id, offerLine);
+    const base = {
+      message: text,
+      random_id: randomId(),
+      keyboard: passengerConfirmKeyboard(order.id),
+    };
+    let messageId;
+    try {
+      messageId = await vkMethod('messages.send', {
+        user_id: order.passenger_user_id,
+        ...base,
+      });
+    } catch {
+      messageId = await vkMethod('messages.send', {
+        peer_id: order.passenger_peer_id,
+        ...base,
+      });
+    }
+    const now = Math.floor(Date.now() / 1000);
+    updatePassengerOfferMessageId.run(Number(messageId), now, order.id);
+    return Number(messageId);
+  }
+
+  async function clearPassengerConfirmButtons(order, resolvedText) {
+    if (!order.passenger_offer_message_id) return;
+    const editBase = {
+      message_id: order.passenger_offer_message_id,
+      message: resolvedText,
+      keyboard: EMPTY_INLINE_KEYBOARD,
+    };
+    const attempts = [
+      { user_id: order.passenger_user_id, ...editBase },
+      { peer_id: order.passenger_peer_id, ...editBase },
+    ];
+    for (const params of attempts) {
+      try {
+        await vkMethod('messages.edit', params);
+        return;
+      } catch (e) {
+        console.warn('[order] edit offer (убрать кнопки)', {
+          orderId: order.id,
+          err: e.message,
+          vk: e.vk,
+        });
+      }
+    }
   }
 
   /**
@@ -475,6 +704,51 @@ export function createWebhookRouter(db) {
 
     const activeEarly = activeOrderForPassenger.get(fromId);
     const driverOrderEarly = activeOrderForDriver.get(fromId);
+    const orderDraft = getOrderDraft.get(fromId);
+
+    if (uiAction === 'cancel_form') {
+      if (orderDraft) await cancelOrderForm(outPeer, fromId);
+      else await sendIdleMenu(outPeer, fromId, 'Сейчас нет формы заказа для отмены.');
+      return;
+    }
+
+    if (orderDraft) {
+      if (uiAction === 'help') {
+        await replyHelpCommunity(outPeer, fromId);
+        return;
+      }
+      if (uiAction === 'order') {
+        await startOrderForm(outPeer, fromId);
+        return;
+      }
+      if (
+        uiAction === 'driver' ||
+        uiAction === 'profile' ||
+        uiAction === 'edit_driver' ||
+        uiAction === 'logout_driver'
+      ) {
+        await sendToPassenger(
+          outPeer,
+          fromId,
+          'Сначала завершите или отмените оформление заказа («❌ Отменить»).',
+          null,
+          passengerOrderFormKeyboard(),
+        );
+        return;
+      }
+      if (text && !isMenuButtonText(text)) {
+        await handleOrderFormInput(outPeer, fromId, text);
+        return;
+      }
+      await sendToPassenger(
+        outPeer,
+        fromId,
+        msgOrderFormPanel(orderDraft, orderDraft.step),
+        null,
+        passengerOrderFormKeyboard(),
+      );
+      return;
+    }
 
     if (uiAction === 'finish_order') {
       if (!driverOrderEarly) {
@@ -553,10 +827,6 @@ export function createWebhookRouter(db) {
     }
 
     const dmSession = getSession.get(fromId);
-    if (dmSession?.mode === 'custom_dm' && dmSession.context_order_id && text && !isMenuButtonText(text)) {
-      await handleDriverCustomReplyInDm(fromId, text, dmSession.context_order_id);
-      return;
-    }
 
     if (
       driverOrderEarly &&
@@ -567,9 +837,6 @@ export function createWebhookRouter(db) {
     ) {
       await sendPeer(driverOrderEarly.passenger_peer_id, `Водитель:\n${text}`, {
         keyboard: passengerDuringOrderKeyboard(),
-      });
-      await sendDriverDm(fromId, '✓ Сообщение отправлено пассажиру.', {
-        keyboard: driverTripKeyboard(),
       });
       return;
     }
@@ -614,12 +881,16 @@ export function createWebhookRouter(db) {
         );
         return;
       }
-      await sendToPassenger(
-        outPeer,
-        fromId,
-        'Опишите маршрут одним сообщением: откуда, куда, комментарий.',
-        null,
-      );
+      if (activeEarly) {
+        await sendToPassenger(
+          outPeer,
+          fromId,
+          msgActiveOrderBlocks('order'),
+          activeEarly,
+        );
+        return;
+      }
+      await startOrderForm(outPeer, fromId);
       return;
     }
 
@@ -668,115 +939,31 @@ export function createWebhookRouter(db) {
     }
 
     if (!text || isMenuButtonText(text)) {
-      const hint = getDriver.get(fromId)
-        ? 'Используйте «👤 Профиль водителя» или «❓ Помощь». Новые заказы — в беседе водителей.'
-        : 'Нажмите «🚕 Заказать такси» и опишите маршрут, или «❓ Помощь».';
-      await sendToPassenger(outPeer, fromId, hint, null);
+      if (isUserDmIdle(fromId)) {
+        const hint = getDriver.get(fromId)
+          ? 'Выберите действие: профиль водителя или помощь. Заказы — в беседе водителей.'
+          : 'Выберите действие: заказать такси, стать водителем или помощь.';
+        await sendIdleMenu(outPeer, fromId, hint);
+      } else {
+        await sendToPassenger(outPeer, fromId, 'Используйте кнопки в диалоге выше или «❓ Помощь».', null);
+      }
       return;
     }
 
     if (getDriver.get(fromId)) {
-      await sendToPassenger(
+      await sendIdleMenu(
         outPeer,
         fromId,
         'Вы водитель — оформление заказов недоступно. Отвечайте на заказы в беседе водителей.',
-        null,
       );
       return;
     }
 
-    const now = Math.floor(Date.now() / 1000);
-    const info = insertOrder.run({
-      passenger_peer_id: outPeer,
-      passenger_user_id: fromId,
-      order_text: text,
-      created_at: now,
-      updated_at: now,
-    });
-
-    const orderId = Number(info.lastInsertRowid);
-    const order = getOrder.get(orderId);
-    try {
-      await postOrderToDrivers(order);
-      await sendToPassenger(outPeer, fromId, msgOrderSearching(orderId), order);
-    } catch (e) {
-      console.error('[order] не удалось отправить в беседу водителей:', e.message, {
-        driversPeerId: config.driversPeerId,
-        vk: e.vk,
-      });
-      await sendToPassenger(
-        outPeer,
-        fromId,
-        `Заказ #${orderId} сохранён, но не удалось опубликовать водителям. Проверьте DRIVERS_PEER_ID и что бот в беседе.`,
-        order,
-      );
-    }
-  }
-
-  async function handleDriverCustomReplyInDm(fromId, text, orderId) {
-    const order = getOrder.get(orderId);
-    if (!order || order.status !== ORDER_STATUS.NEW || order.driver_user_id) {
-      clearSession.run(fromId);
-      return;
-    }
-    const driver = getDriver.get(fromId);
-    if (!driver) {
-      clearSession.run(fromId);
-      await sendDriverDm(fromId, 'Сначала зарегистрируйтесь: «🚗 Я водитель» и позывной.');
-      return;
-    }
-
-    const ok = takeOrder(order.id, fromId, Math.floor(Date.now() / 1000));
-    clearSession.run(fromId);
-    if (!ok) {
-      await sendDriverDm(fromId, `Заказ #${order.id} уже взят другим водителем.`);
-      return;
-    }
-
-    const fresh = getOrder.get(order.id);
-    await sendPeer(fresh.passenger_peer_id, `Водитель (${driver.callsign}) пишет:\n«${text}»`, {
-      keyboard: passengerConfirmKeyboard(fresh.id),
-    });
-    await sendToPassenger(
-      fresh.passenger_peer_id,
-      fresh.passenger_user_id,
-      msgOrderOffer(fresh.id),
-      fresh,
+    await sendIdleMenu(
+      outPeer,
+      fromId,
+      'Чтобы оформить поездку, нажмите «🚕 Заказать такси».',
     );
-
-    await editDriversOrderMessage(
-      fresh,
-      msgDriversChatTaken(fresh.id, driver.callsign),
-      EMPTY_INLINE_KEYBOARD,
-    );
-    await sendDriverDm(fromId, msgDriverUseDmAfterTake(fresh.id, driver.callsign), {
-      keyboard: driverPendingKeyboard(),
-    });
-  }
-
-  async function handleReplyPress(ev, orderId) {
-    const driverId = ev.user_id;
-    const driver = getDriver.get(driverId);
-    if (!driver) {
-      await answerCallbackError(ev, 'Сначала: ЛС сообщества → «🚗 Я водитель»');
-      return;
-    }
-
-    const order = getOrder.get(orderId);
-    if (!order || order.status !== 'new') {
-      await answerCallbackError(ev, 'Заказ недоступен');
-      return;
-    }
-
-    await answerCallbackEvent(ev);
-    upsertSession.run({
-      user_id: driverId,
-      mode: 'custom_dm',
-      context_order_id: orderId,
-    });
-    await sendDriverDm(driverId, msgDriverUseDmCustomReply(orderId), {
-      keyboard: driverPendingKeyboard(),
-    });
   }
 
   async function handleEtaPress(ev, payload) {
@@ -796,7 +983,7 @@ export function createWebhookRouter(db) {
       return;
     }
 
-    const etaKey = kind === '10' ? 10 : 3;
+    const etaKey = kind === '20' ? 20 : kind === '10' ? 10 : 3;
     const etaPhrase = ETA_TEXT[etaKey];
     if (!etaPhrase) {
       await answerCallbackError(ev, 'Неизвестный вариант');
@@ -813,16 +1000,9 @@ export function createWebhookRouter(db) {
     await answerCallbackEvent(ev);
 
     const fresh = getOrder.get(orderId);
-    await sendPeer(
-      fresh.passenger_peer_id,
-      `Водитель (${driver.callsign}) будет у вас ${etaPhrase}.`,
-      { keyboard: passengerConfirmKeyboard(fresh.id) },
-    );
-    await sendToPassenger(
-      fresh.passenger_peer_id,
-      fresh.passenger_user_id,
-      msgOrderOffer(fresh.id),
+    await sendPassengerOffer(
       fresh,
+      `Водитель (${driver.callsign}) будет у вас ${etaPhrase}.`,
     );
 
     await editDriversOrderMessage(
@@ -861,6 +1041,8 @@ export function createWebhookRouter(db) {
     if (!driverId) return;
 
     if (action === 'yes') {
+      await clearPassengerConfirmButtons(order, msgPassengerOfferResolved(orderId, true));
+
       const now = Math.floor(Date.now() / 1000);
       setOrderConfirmed.run(now, orderId);
       const confirmed = getOrder.get(orderId);
@@ -888,20 +1070,19 @@ export function createWebhookRouter(db) {
     }
 
     if (action === 'no') {
+      await clearPassengerConfirmButtons(order, msgPassengerOfferResolved(orderId, false));
+
       const now = Math.floor(Date.now() / 1000);
       setOrderCancelled.run(now, orderId);
-      await sendDriversChat(`Пассажир отменил заказ #${orderId}.`);
-      await sendToPassenger(
+      await sendIdleMenu(
         order.passenger_peer_id,
         order.passenger_user_id,
         msgOrderCancelled(orderId),
-        null,
       );
       clearSession.run(driverId);
-      await editDriversOrderMessage(
-        order,
-        `❌ Заказ #${orderId} отменён пассажиром.`,
-        EMPTY_INLINE_KEYBOARD,
+      await sendDriverDm(
+        driverId,
+        `Пассажир отменил заказ #${orderId}.`,
       );
     }
   }
@@ -916,11 +1097,6 @@ export function createWebhookRouter(db) {
     if (payload.cmd === 'help' || payload.a === 'help') {
       await answerCallbackEvent(ev);
       await replyHelpToUser(ev.user_id, ev.peer_id);
-      return;
-    }
-
-    if (payload.a === 'reply') {
-      await handleReplyPress(ev, Number(payload.o));
       return;
     }
 
