@@ -93,17 +93,17 @@ function menuExtrasRow(isAdmin) {
   return [row];
 }
 
-export function passengerIdleKeyboard(isAdmin = false) {
-  return JSON.stringify({
-    one_time: false,
-    inline: false,
-    buttons: [
-      [textBtn(BTN.ORDER, { cmd: 'order' }, 'positive')],
-      ...menuExtrasRow(isAdmin),
-      [textBtn(BTN.DRIVER, { cmd: 'driver' }, 'primary')],
-      [textBtn(BTN.HELP, { cmd: 'help' }, 'secondary')],
-    ],
-  });
+export function passengerIdleKeyboard(isAdmin = false, canRepeatOrder = false) {
+  const rows = [[textBtn(BTN.ORDER, { cmd: 'order' }, 'positive')]];
+  if (canRepeatOrder) {
+    rows.push([textBtn(BTN.REPEAT_ORDER, { cmd: 'repeat_order' }, 'primary')]);
+  }
+  rows.push(...menuExtrasRow(isAdmin));
+  rows.push(
+    [textBtn(BTN.DRIVER, { cmd: 'driver' }, 'primary')],
+    [textBtn(BTN.HELP, { cmd: 'help' }, 'secondary')],
+  );
+  return JSON.stringify({ one_time: false, inline: false, buttons: rows });
 }
 
 export function registeredDriverKeyboard(isAdmin = false) {
@@ -157,7 +157,18 @@ export function passengerOrderFormKeyboard(isAdmin = false) {
   });
 }
 
-/** Пассажир с активным заказом — только помощь, без завершения заказа. */
+/** Пассажир ждёт водителя (заказ new). */
+export function passengerSearchingKeyboard(isAdmin = false) {
+  const rows = [
+    [textBtn(BTN.CANCEL_SEARCH, { cmd: 'cancel_search' }, 'negative')],
+    [textBtn(BTN.PRICES, { cmd: 'prices' }, 'secondary')],
+  ];
+  if (isAdmin) rows.push([textBtn(BTN.ADMIN, { cmd: 'admin' }, 'secondary')]);
+  rows.push([textBtn(BTN.HELP, { cmd: 'help' }, 'secondary')]);
+  return JSON.stringify({ one_time: false, inline: false, buttons: rows });
+}
+
+/** Пассажир: предложение водителя или поездка. */
 export function passengerDuringOrderKeyboard(isAdmin = false) {
   const rows = [[textBtn(BTN.PRICES, { cmd: 'prices' }, 'secondary')]];
   if (isAdmin) rows.push([textBtn(BTN.ADMIN, { cmd: 'admin' }, 'secondary')]);
@@ -219,15 +230,55 @@ export function passengerConfirmKeyboard(orderId) {
   });
 }
 
-export function adminMenuKeyboard(pendingCount) {
+export function adminMenuKeyboard(pendingCount, approvedCount = 0, blockedCount = 0) {
   const rows = [];
   if (pendingCount > 0) {
     rows.push([
       callbackBtn(`🚗 Заявки (${pendingCount})`, { a: 'admin_pending' }, 'primary'),
     ]);
   }
-  rows.push([callbackBtn('✏️ Изменить цены', { a: 'admin_prices' }, 'secondary')]);
+  if (approvedCount > 0) {
+    rows.push([
+      callbackBtn(`🚫 Заблокировать (${approvedCount})`, { a: 'admin_drivers' }, 'negative'),
+    ]);
+  }
+  if (blockedCount > 0) {
+    rows.push([
+      callbackBtn(`✅ Разблок. (${blockedCount})`, { a: 'admin_blocked' }, 'positive'),
+    ]);
+  }
+  rows.push([
+    callbackBtn('🔢 Блок по VK id', { a: 'admin_block_id' }, 'secondary'),
+    callbackBtn('✏️ Цены', { a: 'admin_prices' }, 'secondary'),
+  ]);
   return JSON.stringify({ inline: true, buttons: rows });
+}
+
+export function adminDriversListKeyboard(drivers) {
+  const rows = drivers.slice(0, 5).map((d) => [
+    callbackBtn(`🚫 ${d.callsign}`, { a: 'adm_block', u: d.user_id }, 'negative'),
+  ]);
+  rows.push([callbackBtn('← Меню', { a: 'admin_menu' }, 'secondary')]);
+  return JSON.stringify({ inline: true, buttons: rows });
+}
+
+export function adminBlockedListKeyboard(drivers) {
+  const rows = drivers.slice(0, 5).map((d) => [
+    callbackBtn(`✅ ${d.callsign}`, { a: 'adm_unblock', u: d.user_id }, 'positive'),
+  ]);
+  rows.push([callbackBtn('← Меню', { a: 'admin_menu' }, 'secondary')]);
+  return JSON.stringify({ inline: true, buttons: rows });
+}
+
+/** Заблокированный водитель — только профиль и помощь */
+export function blockedDriverKeyboard(isAdmin = false) {
+  const rows = [
+    [textBtn(BTN.PROFILE, { cmd: 'profile' }, 'primary')],
+    [textBtn(BTN.PRICES, { cmd: 'prices' }, 'secondary')],
+  ];
+  if (isAdmin) rows.push([textBtn(BTN.ADMIN, { cmd: 'admin' }, 'secondary')]);
+  rows.push([textBtn(BTN.HELP, { cmd: 'help' }, 'secondary')]);
+  return JSON.stringify({ one_time: false, inline: false, buttons: rows });
 }
 
 export function adminPendingListKeyboard(pendingDrivers) {

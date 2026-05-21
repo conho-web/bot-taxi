@@ -1,6 +1,7 @@
 /** Подписи кнопок (ВК при нажатии шлёт их как текст сообщения). */
 export const BTN = {
   ORDER: '🚕 Заказать такси',
+  REPEAT_ORDER: '🔁 Повторить заказ',
   PRICES: '💰 Цены',
   DRIVER: '🚗 Я водитель',
   PROFILE: '👤 Профиль водителя',
@@ -10,12 +11,14 @@ export const BTN = {
   ADMIN: '⚙️ Админ',
   FINISH_ORDER: '🏁 Завершить заказ',
   CANCEL_FORM: '❌ Отменить',
+  CANCEL_SEARCH: '❌ Отменить поиск',
 };
 
 export const DRIVER_STATUS = {
   PENDING: 'pending',
   APPROVED: 'approved',
   REJECTED: 'rejected',
+  BLOCKED: 'blocked',
 };
 
 const MENU_TEXTS = new Set(Object.values(BTN));
@@ -52,12 +55,14 @@ export function uiActionFromMessage(text, payloadRaw) {
   if (t === BTN.PRICES) return 'prices';
   if (t === BTN.ADMIN || t === '/admin') return 'admin';
   if (t === BTN.ORDER) return 'order';
+  if (t === BTN.REPEAT_ORDER) return 'repeat_order';
   if (t === BTN.DRIVER) return 'driver';
   if (t === BTN.PROFILE) return 'profile';
   if (t === BTN.EDIT_DRIVER) return 'edit_driver';
   if (t === BTN.LOGOUT_DRIVER) return 'logout_driver';
   if (t === BTN.FINISH_ORDER) return 'finish_order';
   if (t === BTN.CANCEL_FORM) return 'cancel_form';
+  if (t === BTN.CANCEL_SEARCH) return 'cancel_search';
   return null;
 }
 
@@ -69,13 +74,17 @@ export function passengerPhase(order) {
   return 'idle';
 }
 
-export function msgOrderSearching(orderId) {
-  return [
-    `🆔 Заказ #${orderId} оформлен`,
+export function msgOrderSearching(orderId, isRepeat = false) {
+  const lines = [`🆔 Заказ #${orderId} оформлен`];
+  if (isRepeat) {
+    lines.push('', '🔁 Повтор предыдущего маршрута — отправлен водителям.');
+  }
+  lines.push(
     '',
     '🔍 Ищем водителя. Как только кто-то ответит — пришлём предложение сюда.',
     'Ожидайте сообщение в этом диалоге.',
-  ].join('\n');
+  );
+  return lines.join('\n');
 }
 
 export function msgPassengerOffer(orderId, offerLine) {
@@ -130,6 +139,10 @@ export function msgDriversChatTaken(orderId, callsign) {
   );
 }
 
+export function msgDriversChatPassengerCancelled(orderId) {
+  return `🚕 Заказ #${orderId}\n\n❌ Пассажир отменил заказ.`;
+}
+
 export function msgDriverUseDmAfterTake(orderId, callsign) {
   return [
     `Вы взяли заказ #${orderId} (${callsign}).`,
@@ -161,7 +174,7 @@ export function msgDriverFinishOrder(orderId) {
 }
 
 export function msgActiveOrderBlocks(action) {
-  if (action === 'order') {
+  if (action === 'order' || action === 'repeat_order') {
     return 'Сейчас активен заказ. Дождитесь ответа водителя или его решения по поездке.';
   }
   if (action === 'driver' || action === 'profile' || action === 'edit_driver' || action === 'logout_driver') {
@@ -175,6 +188,11 @@ export function msgDriverProfile(callsign, status = DRIVER_STATUS.APPROVED) {
   if (status === DRIVER_STATUS.PENDING) {
     lines.push('⏳ Статус: заявка на рассмотрении у администратора.');
     lines.push('После одобрения появятся заказы в беседе водителей.');
+    return lines.join('\n');
+  }
+  if (status === DRIVER_STATUS.BLOCKED) {
+    lines.push('🚫 Статус: заблокирован администратором.');
+    lines.push('Заказы недоступны. По вопросам — к администратору сервиса.');
     return lines.join('\n');
   }
   lines.push('Заказы приходят в беседу водителей — там только кнопки ответа.');
@@ -207,26 +225,55 @@ export function msgDriverRejected() {
   ].join('\n');
 }
 
-export function msgAdminMenu(pendingCount) {
+export function msgDriverBlocked() {
   return [
-    '⚙️ Админ-панель',
+    '🚫 Ваш аккаунт водителя заблокирован администратором.',
     '',
-    `Заявок водителей: ${pendingCount}`,
-    '• Водители — одобрить / отклонить',
-    '• Цены — новый текст в prices.txt (или правьте файл на сервере)',
+    'Принимать заказы нельзя. По вопросам обращайтесь к администратору.',
   ].join('\n');
 }
 
-export function helpTextCommunity(isRegisteredDriver, callsign, phase = 'idle', isPendingDriver = false) {
+export function msgDriverUnblocked(callsign) {
+  return [
+    `✅ Блокировка снята. Вы снова можете работать как «${callsign}».`,
+    '',
+    'Заказы — в беседе водителей.',
+  ].join('\n');
+}
+
+export function msgAdminMenu(pendingCount, approvedCount = 0, blockedCount = 0) {
+  return [
+    '⚙️ Админ-панель',
+    '',
+    `Заявок на рассмотрении: ${pendingCount}`,
+    `Активных водителей: ${approvedCount}`,
+    `Заблокировано: ${blockedCount}`,
+    '',
+    '• Заявки — одобрить / отклонить',
+    '• Блокировка — список водителей или по VK id',
+    '• Цены — изменить prices.txt',
+  ].join('\n');
+}
+
+export function helpTextCommunity(
+  isRegisteredDriver,
+  callsign,
+  phase = 'idle',
+  isPendingDriver = false,
+  isBlockedDriver = false,
+) {
   const lines = ['🚕 Справка', ''];
 
   if (phase === 'searching') {
     lines.push('🔍 Идёт поиск водителя. Ждите ответа в этом диалоге.');
+    lines.push('«❌ Отменить поиск» — отменить заказ до ответа водителя.');
   } else if (phase === 'offer') {
     lines.push('Подтвердите поездку кнопками «Да, едем» / «Отмена» над этим меню.');
   } else if (phase === 'trip') {
     lines.push('💬 Вы в диалоге с водителем — пишите сюда.');
     lines.push('🏁 Завершить поездку может только водитель.');
+  } else if (isBlockedDriver) {
+    lines.push('🚫 Аккаунт водителя заблокирован. Заказы недоступны.');
   } else if (isPendingDriver) {
     lines.push('⏳ Заявка водителя на рассмотрении. Заказы пока недоступны.');
   } else if (isRegisteredDriver) {
@@ -235,6 +282,7 @@ export function helpTextCommunity(isRegisteredDriver, callsign, phase = 'idle', 
     lines.push('«👤 Профиль водителя» — позывной и выход из водителей.');
   } else {
     lines.push('👤 Пассажир: «🚕 Заказать такси» → форма (откуда / куда / комментарий).');
+    lines.push('🔁 «Повторить заказ» — снова отправить последний маршрут водителям.');
     lines.push('💰 «💰 Цены» — тарифы.');
     lines.push('🚗 Водитель: «🚗 Я водитель» и позывной (нужно одобрение админа).');
     lines.push('В беседе водителей — принять заказ кнопкой.');
