@@ -6,6 +6,14 @@ function required(name) {
   return v;
 }
 
+function parseAdminIds(raw) {
+  if (!raw || !String(raw).trim()) return [];
+  return String(raw)
+    .split(/[,;\s]+/)
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isFinite(n) && n > 0);
+}
+
 export const config = {
   vkGroupToken: required('VK_GROUP_TOKEN'),
   vkConfirmation: required('VK_CONFIRMATION'),
@@ -14,6 +22,8 @@ export const config = {
   driversPeerId: Number(required('DRIVERS_PEER_ID')),
   /** Ссылка vk.me/join/… если API не выдал invite (опционально) */
   driversChatInviteLink: (process.env.DRIVERS_CHAT_INVITE_LINK || '').trim(),
+  /** VK user_id админов через запятую — модерация водителей и смена цен */
+  adminUserIds: parseAdminIds(process.env.ADMIN_VK_IDS),
   port: Number(process.env.PORT || 3000),
   databasePath: process.env.DATABASE_PATH || './data/bot.sqlite',
   apiVersion: '5.199',

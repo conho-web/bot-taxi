@@ -1,10 +1,14 @@
+import { createAdminApi, isAdmin } from './admin.js';
 import { config } from './config.js';
+import { readPricesMessage } from './prices.js';
 import {
+  DRIVER_STATUS,
   helpTextCommunity,
   helpTextDriversChat,
   isMenuButtonText,
   msgActiveOrderBlocks,
   msgDriverFinishOrder,
+  msgDriverPendingRegistration,
   msgDriverProfile,
   msgDriverTripDm,
   msgDriverUseDmAfterTake,
@@ -28,6 +32,7 @@ import {
   driversChatKeyboard,
   driversOrderKeyboard,
   driverPendingKeyboard,
+  driverProfileKeyboard,
   driverTripKeyboard,
   EMPTY_INLINE_KEYBOARD,
   getChatInviteLink,
@@ -35,8 +40,8 @@ import {
   passengerDuringOrderKeyboard,
   passengerIdleKeyboard,
   passengerOrderFormKeyboard,
+  pendingDriverKeyboard,
   registeredDriverKeyboard,
-  driverProfileKeyboard,
   randomId,
   userPeerForSend,
   vkMethod,
@@ -62,11 +67,17 @@ const ETA_TEXT = {
  */
 export function createWebhookRouter(db) {
   const getDriver = db.prepare('SELECT * FROM drivers WHERE user_id = ?');
-  const upsertDriver = db.prepare(`
-    INSERT INTO drivers (user_id, callsign, created_at)
-    VALUES (@user_id, @callsign, @created_at)
-    ON CONFLICT(user_id) DO UPDATE SET callsign = excluded.callsign
+  const insertDriverPending = db.prepare(`
+    INSERT INTO drivers (user_id, callsign, created_at, status)
+    VALUES (@user_id, @callsign, @created_at, 'pending')
   `);
+  const updateDriverCallsign = db.prepare(
+    'UPDATE drivers SET callsign = ? WHERE user_id = ?',
+  );
+  const setDriverStatus = db.prepare('UPDATE drivers SET status = ? WHERE user_id = ?');
+  const listPendingDrivers = db.prepare(
+    "SELECT * FROM drivers WHERE status = 'pending' ORDER BY created_at ASC",
+  );
   const deleteDriver = db.prepare('DELETE FROM drivers WHERE user_id = ?');
 
   const insertOrder = db.prepare(`
@@ -168,10 +179,24 @@ export function createWebhookRouter(db) {
     });
   }
 
+  function isApprovedDriver(userId) {
+    return getDriver.get(userId)?.status === DRIVER_STATUS.APPROVED;
+  }
+
+  function isPendingDriver(userId) {
+    return getDriver.get(userId)?.status === DRIVER_STATUS.PENDING;
+  }
+
+  function keyboardIsAdmin(userId) {
+    return isAdmin(userId, config);
+  }
+
   /** Главное меню, когда нет заказа, формы и активной поездки. */
   function idleMenuKeyboard(userId) {
-    if (userId && getDriver.get(userId)) return registeredDriverKeyboard();
-    return passengerIdleKeyboard();
+    const adm = keyboardIsAdmin(userId);
+    if (isApprovedDriver(userId)) return registeredDriverKeyboard(adm);
+    if (isPendingDriver(userId)) return pendingDriverKeyboard(adm);
+    return passengerIdleKeyboard(adm);
   }
 
   function passengerKeyboard(userId, order) {
@@ -193,14 +218,16 @@ export function createWebhookRouter(db) {
     if (getOrderDraft.get(userId)) return false;
     const session = getSession.get(userId);
     if (session?.mode === 'register_callsign') return false;
+    if (session?.mode === 'admin_set_prices') return false;
     return true;
   }
 
   function dmKeyboardForUser(userId, { order = null, override = null } = {}) {
+    const adm = keyboardIsAdmin(userId);
     if (override) return override;
-    if (getOrderDraft.get(userId)) return passengerOrderFormKeyboard();
+    if (getOrderDraft.get(userId)) return passengerOrderFormKeyboard(adm);
     const session = getSession.get(userId);
-    if (session?.mode === 'register_callsign') return passengerIdleKeyboard();
+    if (session?.mode === 'register_callsign') return passengerIdleKeyboard(adm);
     const passengerOrder = order ?? activeOrderForPassenger.get(userId);
     if (passengerOrder) return passengerKeyboard(userId, passengerOrder);
     const driverOrder = activeOrderForDriver.get(userId);
@@ -355,19 +382,25 @@ export function createWebhookRouter(db) {
   function driverInfo(userId) {
     const d = getDriver.get(userId);
     return {
-      registered: !!d,
+      registered: d?.status === DRIVER_STATUS.APPROVED,
+      pending: d?.status === DRIVER_STATUS.PENDING,
       callsign: d?.callsign ?? '',
+      status: d?.status ?? null,
     };
   }
 
+  async function sendPricesMessage(peerId, userId, order = null) {
+    await sendToPassenger(peerId, userId, readPricesMessage(), order);
+  }
+
   async function replyHelpCommunity(replyPeerId, userId) {
-    const { registered, callsign } = driverInfo(userId);
+    const { registered, pending, callsign } = driverInfo(userId);
     const active = activeOrderForPassenger.get(userId);
     const phase = passengerPhase(active);
     await sendToPassenger(
       replyPeerId,
       userId,
-      helpTextCommunity(registered, callsign, phase),
+      helpTextCommunity(registered, callsign, phase, pending),
       active,
     );
   }
@@ -555,23 +588,66 @@ export function createWebhookRouter(db) {
     return { added: false, link: config.driversChatInviteLink || null };
   }
 
+  const adminApi = createAdminApi({
+    config,
+    db,
+    getDriver,
+    listPendingDrivers,
+    setDriverStatus,
+    deleteDriver,
+    getSession,
+    upsertSession,
+    clearSession,
+    sendPeer,
+    sendToPassenger,
+    inviteDriverToChat,
+    userPeerForSend,
+    answerCallbackEvent,
+  });
+
   async function completeDriverRegistration(fromId, callsign, replyPeerId) {
     const now = Math.floor(Date.now() / 1000);
-    upsertDriver.run({ user_id: fromId, callsign, created_at: now });
     clearSession.run(fromId);
+    const existing = getDriver.get(fromId);
 
-    const invite = await inviteDriverToChat(fromId);
-    const lines = [`Вы зарегистрированы как «${callsign}».`];
-
-    if (invite.added) {
-      lines.push('', '✅ Вас добавили в беседу водителей. Ждите заказы с кнопками ответа.');
-    } else if (invite.link) {
-      lines.push('', 'Вступите в беседу водителей:', invite.link);
-    } else {
-      lines.push('', 'Попросите админа добавить вас в беседу водителей.');
+    if (existing?.status === DRIVER_STATUS.APPROVED) {
+      updateDriverCallsign.run(callsign, fromId);
+      await sendToPassenger(
+        replyPeerId,
+        fromId,
+        `Позывной обновлён: «${callsign}».`,
+        null,
+      );
+      return;
     }
 
-    await sendToPassenger(replyPeerId, fromId, lines.join('\n'), null);
+    if (existing?.status === DRIVER_STATUS.PENDING) {
+      updateDriverCallsign.run(callsign, fromId);
+      await adminApi.notifyNewDriverApplication(fromId, callsign);
+      await sendToPassenger(
+        replyPeerId,
+        fromId,
+        msgDriverPendingRegistration(callsign),
+        null,
+      );
+      return;
+    }
+
+    try {
+      insertDriverPending.run({ user_id: fromId, callsign, created_at: now });
+    } catch (e) {
+      console.error('[register] insert driver:', e.message);
+      await sendToPassenger(replyPeerId, fromId, 'Не удалось сохранить заявку. Попробуйте позже.', null);
+      return;
+    }
+
+    await adminApi.notifyNewDriverApplication(fromId, callsign);
+    await sendToPassenger(
+      replyPeerId,
+      fromId,
+      msgDriverPendingRegistration(callsign),
+      null,
+    );
   }
 
   async function sendDriverProfile(replyPeerId, userId) {
@@ -586,7 +662,7 @@ export function createWebhookRouter(db) {
       return;
     }
 
-    await sendPeer(replyPeerId, msgDriverProfile(driver.callsign), {
+    await sendPeer(replyPeerId, msgDriverProfile(driver.callsign, driver.status), {
       keyboard: driverProfileKeyboard(),
       random_id: randomId(),
     });
@@ -656,7 +732,7 @@ export function createWebhookRouter(db) {
     });
 
     if (isDriversChat(peerId)) {
-      const isDriver = !!getDriver.get(fromId);
+      const isDriver = isApprovedDriver(fromId);
       if (!isDriver && text && !isMenuButtonText(text)) {
         await sendDriversChat(
           [
@@ -702,7 +778,17 @@ export function createWebhookRouter(db) {
 
     const outPeer = passengerDialogPeerId(msg);
 
+    if (isAdmin(fromId, config)) {
+      const handled = await adminApi.handleAdminMessage(fromId, outPeer, text, uiAction);
+      if (handled) return;
+    }
+
     const activeEarly = activeOrderForPassenger.get(fromId);
+
+    if (uiAction === 'prices') {
+      await sendPricesMessage(outPeer, fromId, activeEarly);
+      return;
+    }
     const driverOrderEarly = activeOrderForDriver.get(fromId);
     const orderDraft = getOrderDraft.get(fromId);
 
@@ -713,6 +799,10 @@ export function createWebhookRouter(db) {
     }
 
     if (orderDraft) {
+      if (uiAction === 'prices') {
+        await sendPricesMessage(outPeer, fromId);
+        return;
+      }
       if (uiAction === 'help') {
         await replyHelpCommunity(outPeer, fromId);
         return;
@@ -872,7 +962,7 @@ export function createWebhookRouter(db) {
     }
 
     if (uiAction === 'order') {
-      if (getDriver.get(fromId)) {
+      if (isApprovedDriver(fromId)) {
         await sendToPassenger(
           outPeer,
           fromId,
@@ -897,8 +987,13 @@ export function createWebhookRouter(db) {
     const active = activeEarly ?? activeOrderForPassenger.get(fromId);
     if (active) {
       if (isMenuButtonText(text)) {
+        if (uiAction === 'prices') {
+          await sendPricesMessage(outPeer, fromId, active);
+          return;
+        }
         if (uiAction === 'help') {
           await replyHelpCommunity(outPeer, fromId);
+          return;
         }
         return;
       }
@@ -940,9 +1035,11 @@ export function createWebhookRouter(db) {
 
     if (!text || isMenuButtonText(text)) {
       if (isUserDmIdle(fromId)) {
-        const hint = getDriver.get(fromId)
+        const hint = isApprovedDriver(fromId)
           ? 'Выберите действие: профиль водителя или помощь. Заказы — в беседе водителей.'
-          : 'Выберите действие: заказать такси, стать водителем или помощь.';
+          : isPendingDriver(fromId)
+            ? 'Заявка водителя на рассмотрении. Можно заказать такси или смотреть цены.'
+            : 'Выберите действие: заказать такси, цены, стать водителем или помощь.';
         await sendIdleMenu(outPeer, fromId, hint);
       } else {
         await sendToPassenger(outPeer, fromId, 'Используйте кнопки в диалоге выше или «❓ Помощь».', null);
@@ -950,7 +1047,7 @@ export function createWebhookRouter(db) {
       return;
     }
 
-    if (getDriver.get(fromId)) {
+    if (isApprovedDriver(fromId)) {
       await sendIdleMenu(
         outPeer,
         fromId,
@@ -974,6 +1071,15 @@ export function createWebhookRouter(db) {
     const driver = getDriver.get(driverId);
     if (!driver) {
       await answerCallbackError(ev, 'Сначала: ЛС сообщества → «🚗 Я водитель»');
+      return;
+    }
+    if (driver.status !== DRIVER_STATUS.APPROVED) {
+      await answerCallbackError(
+        ev,
+        driver.status === DRIVER_STATUS.PENDING
+          ? 'Ожидайте одобрения администратора'
+          : 'Вы не одобрены как водитель',
+      );
       return;
     }
 
@@ -1102,6 +1208,17 @@ export function createWebhookRouter(db) {
 
     if (payload.a === 'eta') {
       await handleEtaPress(ev, payload);
+      return;
+    }
+    if (
+      payload.a === 'adm_ok' ||
+      payload.a === 'adm_no' ||
+      payload.a === 'admin_pending' ||
+      payload.a === 'admin_menu' ||
+      payload.a === 'admin_prices'
+    ) {
+      const handled = await adminApi.handleAdminCallback(ev, payload);
+      if (!handled) await answerCallbackError(ev, 'Нет доступа или неизвестное действие');
       return;
     }
     if (payload.a === 'yes' || payload.a === 'no') {

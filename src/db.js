@@ -15,6 +15,7 @@ export function openDb(databasePath) {
     CREATE TABLE IF NOT EXISTS drivers (
       user_id INTEGER PRIMARY KEY NOT NULL,
       callsign TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
       created_at INTEGER NOT NULL
     );
 
@@ -53,6 +54,12 @@ export function openDb(databasePath) {
   `);
   try {
     db.exec('ALTER TABLE orders ADD COLUMN passenger_offer_message_id INTEGER');
+  } catch {
+    // колонка уже есть
+  }
+  try {
+    db.exec("ALTER TABLE drivers ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'");
+    db.exec("UPDATE drivers SET status = 'approved' WHERE status IS NULL OR status = ''");
   } catch {
     // колонка уже есть
   }

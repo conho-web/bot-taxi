@@ -1,13 +1,21 @@
 /** Подписи кнопок (ВК при нажатии шлёт их как текст сообщения). */
 export const BTN = {
   ORDER: '🚕 Заказать такси',
+  PRICES: '💰 Цены',
   DRIVER: '🚗 Я водитель',
   PROFILE: '👤 Профиль водителя',
   EDIT_DRIVER: '✏️ Изменить позывной',
   LOGOUT_DRIVER: '🚪 Выйти из водителей',
   HELP: '❓ Помощь',
+  ADMIN: '⚙️ Админ',
   FINISH_ORDER: '🏁 Завершить заказ',
   CANCEL_FORM: '❌ Отменить',
+};
+
+export const DRIVER_STATUS = {
+  PENDING: 'pending',
+  APPROVED: 'approved',
+  REJECTED: 'rejected',
 };
 
 const MENU_TEXTS = new Set(Object.values(BTN));
@@ -41,6 +49,8 @@ export function uiActionFromMessage(text, payloadRaw) {
 
   const t = (text || '').trim();
   if (t === BTN.HELP || /^\/help$/i.test(t) || /^\/start$/i.test(t)) return 'help';
+  if (t === BTN.PRICES) return 'prices';
+  if (t === BTN.ADMIN || t === '/admin') return 'admin';
   if (t === BTN.ORDER) return 'order';
   if (t === BTN.DRIVER) return 'driver';
   if (t === BTN.PROFILE) return 'profile';
@@ -160,18 +170,54 @@ export function msgActiveOrderBlocks(action) {
   return 'Сейчас активен заказ. Используйте подсказки в диалоге.';
 }
 
-export function msgDriverProfile(callsign) {
+export function msgDriverProfile(callsign, status = DRIVER_STATUS.APPROVED) {
+  const lines = ['👤 Профиль водителя', '', `Позывной: «${callsign}»`, ''];
+  if (status === DRIVER_STATUS.PENDING) {
+    lines.push('⏳ Статус: заявка на рассмотрении у администратора.');
+    lines.push('После одобрения появятся заказы в беседе водителей.');
+    return lines.join('\n');
+  }
+  lines.push('Заказы приходят в беседу водителей — там только кнопки ответа.');
+  lines.push('С пассажирами общайтесь в личке с ботом после взятия заказа.');
+  return lines.join('\n');
+}
+
+export function msgDriverPendingRegistration(callsign) {
   return [
-    '👤 Профиль водителя',
+    `Заявка принята: «${callsign}».`,
     '',
-    `Позывной: «${callsign}»`,
-    '',
-    'Заказы приходят в беседу водителей — там только кнопки ответа.',
-    'С пассажирами общайтесь в личке с ботом после взятия заказа.',
+    '⏳ Ожидайте подтверждения администратора.',
+    'Когда вас одобрят — придёт сообщение и доступ к заказам в беседе водителей.',
   ].join('\n');
 }
 
-export function helpTextCommunity(isRegisteredDriver, callsign, phase = 'idle') {
+export function msgDriverApproved(callsign) {
+  return [
+    `✅ Вы одобрены как водитель «${callsign}».`,
+    '',
+    'Можете брать заказы в беседе водителей (кнопки ~3-5 / ~10 / ~20 мин).',
+  ].join('\n');
+}
+
+export function msgDriverRejected() {
+  return [
+    '❌ Заявка водителя отклонена.',
+    '',
+    'Можно подать заявку снова: «🚗 Я водитель» и новый позывной.',
+  ].join('\n');
+}
+
+export function msgAdminMenu(pendingCount) {
+  return [
+    '⚙️ Админ-панель',
+    '',
+    `Заявок водителей: ${pendingCount}`,
+    '• Водители — одобрить / отклонить',
+    '• Цены — новый текст в prices.txt (или правьте файл на сервере)',
+  ].join('\n');
+}
+
+export function helpTextCommunity(isRegisteredDriver, callsign, phase = 'idle', isPendingDriver = false) {
   const lines = ['🚕 Справка', ''];
 
   if (phase === 'searching') {
@@ -181,13 +227,16 @@ export function helpTextCommunity(isRegisteredDriver, callsign, phase = 'idle') 
   } else if (phase === 'trip') {
     lines.push('💬 Вы в диалоге с водителем — пишите сюда.');
     lines.push('🏁 Завершить поездку может только водитель.');
+  } else if (isPendingDriver) {
+    lines.push('⏳ Заявка водителя на рассмотрении. Заказы пока недоступны.');
   } else if (isRegisteredDriver) {
     lines.push('🚗 Вы водитель — заказы в беседе водителей (кнопки ~3-5 / ~10 / ~20 мин).');
     lines.push('Переписка с пассажиром и завершение поездки — в личке с ботом.');
     lines.push('«👤 Профиль водителя» — позывной и выход из водителей.');
   } else {
     lines.push('👤 Пассажир: «🚕 Заказать такси» → форма (откуда / куда / комментарий).');
-    lines.push('🚗 Водитель: «🚗 Я водитель» и позывной.');
+    lines.push('💰 «💰 Цены» — тарифы.');
+    lines.push('🚗 Водитель: «🚗 Я водитель» и позывной (нужно одобрение админа).');
     lines.push('В беседе водителей — принять заказ кнопкой.');
     lines.push('Переписка с пассажиром — в личке с ботом.');
   }

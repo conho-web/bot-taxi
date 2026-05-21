@@ -87,24 +87,45 @@ function callbackBtn(label, payloadObj, color = 'primary') {
   };
 }
 
-export function passengerIdleKeyboard() {
+function menuExtrasRow(isAdmin) {
+  const row = [textBtn(BTN.PRICES, { cmd: 'prices' }, 'secondary')];
+  if (isAdmin) row.push(textBtn(BTN.ADMIN, { cmd: 'admin' }, 'secondary'));
+  return [row];
+}
+
+export function passengerIdleKeyboard(isAdmin = false) {
   return JSON.stringify({
     one_time: false,
     inline: false,
     buttons: [
       [textBtn(BTN.ORDER, { cmd: 'order' }, 'positive')],
+      ...menuExtrasRow(isAdmin),
       [textBtn(BTN.DRIVER, { cmd: 'driver' }, 'primary')],
       [textBtn(BTN.HELP, { cmd: 'help' }, 'secondary')],
     ],
   });
 }
 
-export function registeredDriverKeyboard() {
+export function registeredDriverKeyboard(isAdmin = false) {
   return JSON.stringify({
     one_time: false,
     inline: false,
     buttons: [
       [textBtn(BTN.PROFILE, { cmd: 'profile' }, 'primary')],
+      ...menuExtrasRow(isAdmin),
+      [textBtn(BTN.HELP, { cmd: 'help' }, 'secondary')],
+    ],
+  });
+}
+
+/** Водитель ждёт одобрения админа */
+export function pendingDriverKeyboard(isAdmin = false) {
+  return JSON.stringify({
+    one_time: false,
+    inline: false,
+    buttons: [
+      [textBtn(BTN.PROFILE, { cmd: 'profile' }, 'primary')],
+      ...menuExtrasRow(isAdmin),
       [textBtn(BTN.HELP, { cmd: 'help' }, 'secondary')],
     ],
   });
@@ -123,24 +144,25 @@ export function driverProfileKeyboard() {
 }
 
 /** Заполнение формы заказа. */
-export function passengerOrderFormKeyboard() {
+export function passengerOrderFormKeyboard(isAdmin = false) {
   return JSON.stringify({
     one_time: false,
     inline: false,
     buttons: [
       [textBtn(BTN.CANCEL_FORM, { cmd: 'cancel_form' }, 'negative')],
+      [textBtn(BTN.PRICES, { cmd: 'prices' }, 'secondary')],
+      ...(isAdmin ? [[textBtn(BTN.ADMIN, { cmd: 'admin' }, 'secondary')]] : []),
       [textBtn(BTN.HELP, { cmd: 'help' }, 'secondary')],
     ],
   });
 }
 
 /** Пассажир с активным заказом — только помощь, без завершения заказа. */
-export function passengerDuringOrderKeyboard() {
-  return JSON.stringify({
-    one_time: false,
-    inline: false,
-    buttons: [[textBtn(BTN.HELP, { cmd: 'help' }, 'secondary')]],
-  });
+export function passengerDuringOrderKeyboard(isAdmin = false) {
+  const rows = [[textBtn(BTN.PRICES, { cmd: 'prices' }, 'secondary')]];
+  if (isAdmin) rows.push([textBtn(BTN.ADMIN, { cmd: 'admin' }, 'secondary')]);
+  rows.push([textBtn(BTN.HELP, { cmd: 'help' }, 'secondary')]);
+  return JSON.stringify({ one_time: false, inline: false, buttons: rows });
 }
 
 /** Водитель ждёт подтверждения пассажира. */
@@ -193,6 +215,39 @@ export function passengerConfirmKeyboard(orderId) {
         callbackBtn('Да, едем', { a: 'yes', o: orderId }, 'positive'),
         callbackBtn('Отмена', { a: 'no', o: orderId }, 'negative'),
       ],
+    ],
+  });
+}
+
+export function adminMenuKeyboard(pendingCount) {
+  const rows = [];
+  if (pendingCount > 0) {
+    rows.push([
+      callbackBtn(`🚗 Заявки (${pendingCount})`, { a: 'admin_pending' }, 'primary'),
+    ]);
+  }
+  rows.push([callbackBtn('✏️ Изменить цены', { a: 'admin_prices' }, 'secondary')]);
+  return JSON.stringify({ inline: true, buttons: rows });
+}
+
+export function adminPendingListKeyboard(pendingDrivers) {
+  const rows = pendingDrivers.slice(0, 5).map((d) => [
+    callbackBtn(`✅ ${d.callsign}`, { a: 'adm_ok', u: d.user_id }, 'positive'),
+    callbackBtn('❌', { a: 'adm_no', u: d.user_id }, 'negative'),
+  ]);
+  rows.push([callbackBtn('← Меню', { a: 'admin_menu' }, 'secondary')]);
+  return JSON.stringify({ inline: true, buttons: rows });
+}
+
+export function adminDriverReviewKeyboard(userId, callsign) {
+  return JSON.stringify({
+    inline: true,
+    buttons: [
+      [
+        callbackBtn(`✅ ${callsign}`, { a: 'adm_ok', u: userId }, 'positive'),
+        callbackBtn('❌ Отклонить', { a: 'adm_no', u: userId }, 'negative'),
+      ],
+      [callbackBtn('← Меню', { a: 'admin_menu' }, 'secondary')],
     ],
   });
 }
