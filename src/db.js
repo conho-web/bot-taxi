@@ -63,5 +63,15 @@ export function openDb(databasePath) {
   } catch {
     // колонка уже есть
   }
+  try {
+    db.exec('ALTER TABLE orders ADD COLUMN driver_waiting_sent INTEGER NOT NULL DEFAULT 0');
+  } catch {
+    // колонка уже есть
+  }
+  try {
+    db.exec('ALTER TABLE orders ADD COLUMN eta_phrase TEXT');
+  } catch {
+    // колонка уже есть
+  }
   return db;
 }

@@ -27,4 +27,13 @@ export const config = {
   port: Number(process.env.PORT || 3000),
   databasePath: process.env.DATABASE_PATH || './data/bot.sqlite',
   apiVersion: '5.199',
+  /** Показывать «🏁 Завершить заказ» (false — только «⏳ Ожидаю», см. SIMPLE_DRIVER_FLOW) */
+  showDriverFinishButton: process.env.DRIVER_FINISH_BUTTON !== 'false',
+  /**
+   * Упрощённый режим: без «Завершить»; при «Ожидаю» по заказу N
+   * автоматически завершаются остальные подтверждённые поездки этого водителя.
+   */
+  simpleDriverFlow: process.env.SIMPLE_DRIVER_FLOW === 'true',
+  /** Временно: один пассажир — несколько параллельных заказов (несколько машин) */
+  multiplePassengerOrders: process.env.MULTIPLE_PASSENGER_ORDERS !== 'false',
 };

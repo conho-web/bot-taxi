@@ -185,16 +185,69 @@ export function driverPendingKeyboard() {
   });
 }
 
-/** Активная поездка — завершить может только водитель. */
-export function driverTripKeyboard() {
+/** Водитель ждёт подтверждения, но уже взял заказ(ы). */
+export function driverPendingWorkKeyboard() {
   return JSON.stringify({
     one_time: false,
     inline: false,
     buttons: [
-      [textBtn(BTN.FINISH_ORDER, { cmd: 'finish_order' }, 'negative')],
+      [textBtn(BTN.MY_TRIPS, { cmd: 'my_trips' }, 'primary')],
       [textBtn(BTN.HELP, { cmd: 'help' }, 'secondary')],
     ],
   });
+}
+
+/** Активная поездка: список, ожидание (один раз), завершение — только текущий заказ. */
+export function driverTripKeyboard(orderId, showFinish = true, showWaiting = true) {
+  const rows = [[textBtn(BTN.MY_TRIPS, { cmd: 'my_trips' }, 'primary')]];
+  if (showWaiting && orderId) {
+    rows.push([textBtn(`⏳ Ожидаю #${orderId}`, { cmd: 'waiting' }, 'primary')]);
+  }
+  if (showFinish && orderId) {
+    rows.push([textBtn(`🏁 Завершить #${orderId}`, { cmd: 'finish_order' }, 'negative')]);
+  }
+  rows.push([textBtn(BTN.HELP, { cmd: 'help' }, 'secondary')]);
+  return JSON.stringify({ one_time: false, inline: false, buttons: rows });
+}
+
+/** Inline: ожидаю / завершить — только для текущего подтверждённого заказа */
+export function driverTripsInlineKeyboard(currentOrder, showFinish = true) {
+  if (!currentOrder || currentOrder.status !== 'confirmed') return null;
+  const row = [];
+  if (!Number(currentOrder.driver_waiting_sent)) {
+    row.push(
+      callbackBtn(
+        `⏳ Ожидаю #${currentOrder.id}`,
+        { a: 'dw', o: currentOrder.id },
+        'primary',
+      ),
+    );
+  }
+  if (showFinish) {
+    row.push(
+      callbackBtn(
+        `🏁 Завершить #${currentOrder.id}`,
+        { a: 'dfin', o: currentOrder.id },
+        'negative',
+      ),
+    );
+  }
+  if (!row.length) return null;
+  return JSON.stringify({ inline: true, buttons: [row] });
+}
+
+/** Пассажир с одним или несколькими активными заказами (временный режим). */
+export function passengerMultiActiveKeyboard(isAdmin = false, canCancelSearch = false, canRepeat = false) {
+  const rows = [[textBtn(BTN.ORDER, { cmd: 'order' }, 'positive')]];
+  if (canRepeat) {
+    rows.push([textBtn(BTN.REPEAT_ORDER, { cmd: 'repeat_order' }, 'primary')]);
+  }
+  if (canCancelSearch) {
+    rows.push([textBtn(BTN.CANCEL_SEARCH, { cmd: 'cancel_search' }, 'negative')]);
+  }
+  rows.push(...menuExtrasRow(isAdmin));
+  rows.push([textBtn(BTN.HELP, { cmd: 'help' }, 'secondary')]);
+  return JSON.stringify({ one_time: false, inline: false, buttons: rows });
 }
 
 export function driversChatKeyboard() {
@@ -210,10 +263,11 @@ export function driversOrderKeyboard(orderId) {
     inline: true,
     buttons: [
       [
-        callbackBtn('~ 3-5 мин', { a: 'eta', o: orderId, t: '3' }, 'positive'),
-        callbackBtn('~ 10 мин', { a: 'eta', o: orderId, t: '10' }, 'primary'),
-        callbackBtn('~ 20 мин', { a: 'eta', o: orderId, t: '20' }, 'secondary'),
+        callbackBtn('~ 3-5', { a: 'eta', o: orderId, t: '3' }, 'positive'),
+        callbackBtn('~ 10', { a: 'eta', o: orderId, t: '10' }, 'primary'),
+        callbackBtn('~ 20', { a: 'eta', o: orderId, t: '20' }, 'secondary'),
       ],
+      [callbackBtn('✏️ Своё время', { a: 'eta_custom', o: orderId }, 'secondary')],
     ],
   });
 }

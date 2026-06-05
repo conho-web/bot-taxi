@@ -1,5 +1,10 @@
 import { createAdminApi, isAdmin } from './admin.js';
 import { config } from './config.js';
+import {
+  etaPhraseFromPreset,
+  formatCustomEtaPhrase,
+  passengerOfferEtaLine,
+} from './driverEta.js';
 import { readPricesMessage } from './prices.js';
 import {
   DRIVER_STATUS,
@@ -9,10 +14,16 @@ import {
   msgActiveOrderBlocks,
   msgDriverFinishOrder,
   msgDriverBlocked,
+  msgDriverCustomEtaPrompt,
+  msgDriverNotCurrentOrder,
+  msgDriverOrderFinishedNext,
   msgDriverPendingRegistration,
   msgDriverProfile,
   msgDriverTripDm,
+  msgDriverTripsPanel,
+  msgDriverWaitingSent,
   msgDriverUseDmAfterTake,
+  msgPassengerDriverWaiting,
   msgDriversChatPassengerCancelled,
   msgDriversChatTaken,
   msgOrderCancelled,
@@ -36,12 +47,15 @@ import {
   driversOrderKeyboard,
   driverPendingKeyboard,
   driverProfileKeyboard,
+  driverPendingWorkKeyboard,
   driverTripKeyboard,
+  driverTripsInlineKeyboard,
   EMPTY_INLINE_KEYBOARD,
   getChatInviteLink,
   passengerConfirmKeyboard,
   passengerDuringOrderKeyboard,
   passengerIdleKeyboard,
+  passengerMultiActiveKeyboard,
   passengerSearchingKeyboard,
   passengerOrderFormKeyboard,
   pendingDriverKeyboard,
@@ -58,13 +72,6 @@ import {
   msgOrderFormPanel,
   nextStep,
 } from './orderForm.js';
-
-const ETA_TEXT = {
-  3: 'примерно через 3–5 минут',
-  10: 'примерно через 10 минут',
-  20: 'примерно через 20 минут',
-};
-
 
 /**
  * @param {import('better-sqlite3').Database} db
@@ -104,13 +111,13 @@ export function createWebhookRouter(db) {
 
   const getOrder = db.prepare('SELECT * FROM orders WHERE id = ?');
 
-  const takeOrder = db.transaction((orderId, driverUserId, now) => {
+  const takeOrder = db.transaction((orderId, driverUserId, etaPhrase, now) => {
     const u = db
       .prepare(
-        `UPDATE orders SET status = 'pending_passenger', driver_user_id = ?, updated_at = ?
+        `UPDATE orders SET status = 'pending_passenger', driver_user_id = ?, eta_phrase = ?, updated_at = ?
          WHERE id = ? AND status = 'new'`,
       )
-      .run(driverUserId, now, orderId);
+      .run(driverUserId, etaPhrase, now, orderId);
     return u.changes === 1;
   });
 
@@ -164,17 +171,164 @@ export function createWebhookRouter(db) {
     ORDER BY id DESC LIMIT 1
   `);
 
+  const listPassengerActiveOrders = db.prepare(`
+    SELECT * FROM orders
+    WHERE passenger_user_id = ? AND status IN ('new', 'pending_passenger', 'confirmed')
+    ORDER BY id ASC
+  `);
+
+  const setDriverWaitingSent = db.prepare(
+    'UPDATE orders SET driver_waiting_sent = 1, updated_at = ? WHERE id = ?',
+  );
+
   const getLastPassengerOrder = db.prepare(`
     SELECT order_text FROM orders
     WHERE passenger_user_id = ?
     ORDER BY id DESC LIMIT 1
   `);
 
-  const activeOrderForDriver = db.prepare(`
+  const listDriverActiveOrders = db.prepare(`
     SELECT * FROM orders
     WHERE driver_user_id = ? AND status IN ('pending_passenger', 'confirmed')
-    ORDER BY id DESC LIMIT 1
+    ORDER BY id ASC
   `);
+
+  function driverConfirmedOrders(userId) {
+    return listDriverActiveOrders
+      .all(userId)
+      .filter((o) => o.status === ORDER_STATUS.CONFIRMED);
+  }
+
+  function driverHasActiveOrders(userId) {
+    return listDriverActiveOrders.all(userId).length > 0;
+  }
+
+  /** Текущий заказ водителя — самый ранний активный (FIFO). */
+  function getDriverCurrentOrder(userId) {
+    const orders = listDriverActiveOrders.all(userId);
+    return orders[0] ?? null;
+  }
+
+  function syncDriverCurrentFocus(userId) {
+    const current = getDriverCurrentOrder(userId);
+    upsertSession.run({
+      user_id: userId,
+      mode: 'idle',
+      context_order_id: current?.id ?? null,
+    });
+  }
+
+  function isDriverCurrentOrder(userId, orderId) {
+    const current = getDriverCurrentOrder(userId);
+    return !!(current && current.id === orderId);
+  }
+
+  /** #12 текст → заказ 12; иначе фокусная поездка */
+  function parseDriverRelayText(text) {
+    const m = (text || '').trim().match(/^#(\d+)\s*(.*)$/s);
+    if (!m) return { orderId: null, body: (text || '').trim() };
+    return { orderId: Number(m[1]), body: (m[2] || '').trim() };
+  }
+
+  function resolveDriverRelayOrder(driverUserId, orderId, body) {
+    const current = getDriverCurrentOrder(driverUserId);
+    if (!current || current.status !== ORDER_STATUS.CONFIRMED) return null;
+    if (orderId) {
+      return orderId === current.id ? current : null;
+    }
+    if (!body) return null;
+    return current;
+  }
+
+  function allowMultiPassengerOrders() {
+    return config.multiplePassengerOrders;
+  }
+
+  function passengerActiveOrders(userId) {
+    return listPassengerActiveOrders.all(userId);
+  }
+
+  function passengerHasActiveOrders(userId) {
+    return passengerActiveOrders(userId).length > 0;
+  }
+
+  function passengerSearchingOrders(userId) {
+    return passengerActiveOrders(userId).filter((o) => o.status === ORDER_STATUS.NEW);
+  }
+
+  function passengerLatestSearching(userId) {
+    const list = passengerSearchingOrders(userId);
+    return list.length ? list[list.length - 1] : null;
+  }
+
+  function passengerConfirmedOrders(userId) {
+    return passengerActiveOrders(userId).filter(
+      (o) => o.status === ORDER_STATUS.CONFIRMED && o.driver_user_id,
+    );
+  }
+
+  function getPrimaryPassengerOrder(userId) {
+    if (!allowMultiPassengerOrders()) {
+      return activeOrderForPassenger.get(userId);
+    }
+    const orders = passengerActiveOrders(userId);
+    if (!orders.length) return null;
+    const session = getSession.get(userId);
+    if (session?.context_order_id) {
+      const found = orders.find((o) => o.id === session.context_order_id);
+      if (found) return found;
+    }
+    return orders[orders.length - 1];
+  }
+
+  function setPassengerFocus(userId, orderId) {
+    upsertSession.run({
+      user_id: userId,
+      mode: 'idle',
+      context_order_id: orderId ?? null,
+    });
+  }
+
+  function resolvePassengerRelayOrder(userId, orderId, body) {
+    const confirmed = passengerConfirmedOrders(userId);
+    if (!confirmed.length) return null;
+    if (orderId) return confirmed.find((o) => o.id === orderId) ?? null;
+    if (!body) return null;
+    return getPrimaryPassengerOrder(userId);
+  }
+
+  function passengerMultiKeyboard(userId) {
+    const adm = keyboardIsAdmin(userId);
+    return passengerMultiActiveKeyboard(
+      adm,
+      passengerSearchingOrders(userId).length > 0,
+      canRepeatLastOrder(userId),
+    );
+  }
+
+  function driverWorkKeyboard(userId) {
+    const current = getDriverCurrentOrder(userId);
+    if (current?.status === ORDER_STATUS.CONFIRMED) {
+      return driverTripKeyboardForUser(userId);
+    }
+    if (driverHasActiveOrders(userId)) {
+      return driverPendingWorkKeyboard();
+    }
+    return registeredDriverKeyboard(keyboardIsAdmin(userId));
+  }
+
+  function driverTripKeyboardForUser(userId) {
+    const current = getDriverCurrentOrder(userId);
+    if (!current || current.status !== ORDER_STATUS.CONFIRMED) {
+      return driverPendingWorkKeyboard();
+    }
+    const showWaiting = !Number(current.driver_waiting_sent);
+    return driverTripKeyboard(
+      current.id,
+      config.simpleDriverFlow ? false : config.showDriverFinishButton,
+      showWaiting,
+    );
+  }
 
   async function sendPeer(peerId, text, extra = {}) {
     await vkMethod('messages.send', {
@@ -186,13 +340,11 @@ export function createWebhookRouter(db) {
   }
 
   async function sendDriverDm(driverUserId, text, extra = {}) {
-    const driverOrder = activeOrderForDriver.get(driverUserId);
     let keyboard = extra.keyboard;
-    // Во время поездки всегда оставляем «Завершить заказ» (новое сообщение без неё сбивает клавиатуру в ВК)
-    if (driverOrder?.status === ORDER_STATUS.CONFIRMED) {
-      keyboard = driverTripKeyboard();
+    if (!keyboard && driverHasActiveOrders(driverUserId)) {
+      keyboard = driverWorkKeyboard(driverUserId);
     } else if (!keyboard) {
-      keyboard = dmKeyboardForUser(driverUserId, { order: driverOrder });
+      keyboard = dmKeyboardForUser(driverUserId);
     }
     await sendPeer(userPeerForSend(driverUserId), text, {
       keyboard,
@@ -217,7 +369,7 @@ export function createWebhookRouter(db) {
   }
 
   function canRepeatLastOrder(userId) {
-    if (activeOrderForPassenger.get(userId)) return false;
+    if (!allowMultiPassengerOrders() && activeOrderForPassenger.get(userId)) return false;
     if (getOrderDraft.get(userId)) return false;
     if (isApprovedDriver(userId)) return false;
     const last = getLastPassengerOrder.get(userId);
@@ -241,21 +393,15 @@ export function createWebhookRouter(db) {
     return passengerDuringOrderKeyboard(adm);
   }
 
-  function driverDmKeyboard(order) {
-    if (!order) return registeredDriverKeyboard();
-    if (order.status === ORDER_STATUS.CONFIRMED) return driverTripKeyboard();
-    if (order.status === ORDER_STATUS.PENDING) return driverPendingKeyboard();
-    return registeredDriverKeyboard();
-  }
-
   function isUserDmIdle(userId) {
-    if (activeOrderForPassenger.get(userId)) return false;
-    if (activeOrderForDriver.get(userId)) return false;
+    if (passengerHasActiveOrders(userId)) return false;
+    if (driverHasActiveOrders(userId)) return false;
     if (getOrderDraft.get(userId)) return false;
     const session = getSession.get(userId);
     if (session?.mode === 'register_callsign') return false;
     if (session?.mode === 'admin_set_prices') return false;
     if (session?.mode === 'admin_block_id') return false;
+    if (session?.mode === 'driver_eta_custom') return false;
     return true;
   }
 
@@ -265,10 +411,14 @@ export function createWebhookRouter(db) {
     if (getOrderDraft.get(userId)) return passengerOrderFormKeyboard(adm);
     const session = getSession.get(userId);
     if (session?.mode === 'register_callsign') return passengerIdleKeyboard(adm);
-    const passengerOrder = order ?? activeOrderForPassenger.get(userId);
+    if (allowMultiPassengerOrders() && passengerHasActiveOrders(userId)) {
+      return passengerMultiKeyboard(userId);
+    }
+    const passengerOrder = order ?? getPrimaryPassengerOrder(userId);
     if (passengerOrder) return passengerKeyboard(userId, passengerOrder);
-    const driverOrder = activeOrderForDriver.get(userId);
-    if (driverOrder) return driverDmKeyboard(driverOrder);
+    if (driverHasActiveOrders(userId)) {
+      return driverWorkKeyboard(userId);
+    }
     return idleMenuKeyboard(userId);
   }
 
@@ -281,6 +431,14 @@ export function createWebhookRouter(db) {
 
   async function sendIdleMenu(peerId, userId, text) {
     await sendToPassenger(peerId, userId, text, null, idleMenuKeyboard(userId));
+  }
+
+  async function notifyPassengerAfterOrderClosed(peerId, userId, text) {
+    if (allowMultiPassengerOrders() && passengerHasActiveOrders(userId)) {
+      await sendToPassenger(peerId, userId, text, getPrimaryPassengerOrder(userId));
+    } else {
+      await sendIdleMenu(peerId, userId, text);
+    }
   }
 
   function hasOrderDraft(userId) {
@@ -448,43 +606,178 @@ export function createWebhookRouter(db) {
 
   async function replyHelpCommunity(replyPeerId, userId) {
     const { registered, pending, blocked, callsign } = driverInfo(userId);
-    const active = activeOrderForPassenger.get(userId);
-    const phase = passengerPhase(active);
-    await sendToPassenger(
-      replyPeerId,
-      userId,
-      helpTextCommunity(registered, callsign, phase, pending, blocked),
-      active,
-    );
+    const active = getPrimaryPassengerOrder(userId);
+    const phase = allowMultiPassengerOrders() && passengerActiveOrders(userId).length > 1
+      ? 'idle'
+      : passengerPhase(active);
+    const lines = [helpTextCommunity(registered, callsign, phase, pending, blocked)];
+    if (allowMultiPassengerOrders()) {
+      const cnt = passengerActiveOrders(userId).length;
+      lines.push('', 'Можно оформить несколько заказов подряд (несколько машин).');
+      if (cnt > 1) {
+        lines.push(`Активных заказов: ${cnt}. Сообщение водителю: #номер текст`);
+      }
+    }
+    await sendToPassenger(replyPeerId, userId, lines.join('\n'), active);
   }
 
-  async function finishDriverOrder(order, driverUserId) {
+  async function finishDriverOrder(order, driverUserId, { silent = false } = {}) {
     const fresh = getOrder.get(order.id);
     if (!fresh || fresh.driver_user_id !== driverUserId) return;
+    if (!silent) {
+      const current = getDriverCurrentOrder(driverUserId);
+      if (!current || fresh.id !== current.id) {
+        if (current) {
+          await sendDriverDm(driverUserId, msgDriverNotCurrentOrder(current.id, fresh.id));
+        }
+        return;
+      }
+    }
     if (fresh.status !== ORDER_STATUS.CONFIRMED) {
       await sendDriverDm(
         driverUserId,
         'Завершить поездку можно только после подтверждения пассажиром «Да, едем».',
-        { keyboard: driverDmKeyboard(fresh) },
       );
       return;
     }
 
     const now = Math.floor(Date.now() / 1000);
     setOrderCompleted.run(now, fresh.id);
-    clearSession.run(driverUserId);
 
-    await sendIdleMenu(
+    await notifyPassengerAfterOrderClosed(
       fresh.passenger_peer_id,
       fresh.passenger_user_id,
       msgOrderFinished(fresh.id),
     );
-    await sendDriverDm(driverUserId, msgDriverFinishOrder(fresh.id));
+
+    const remaining = listDriverActiveOrders.all(driverUserId);
+    if (remaining.length > 0) {
+      syncDriverCurrentFocus(driverUserId);
+      if (!silent) {
+        const next = remaining[0];
+        await sendDriverDm(
+          driverUserId,
+          msgDriverOrderFinishedNext(fresh.id, next.id, remaining.length),
+          { keyboard: driverWorkKeyboard(driverUserId) },
+        );
+      }
+    } else {
+      clearSession.run(driverUserId);
+      if (!silent) {
+        await sendDriverDm(driverUserId, msgDriverFinishOrder(fresh.id), {
+          keyboard: registeredDriverKeyboard(keyboardIsAdmin(driverUserId)),
+        });
+      }
+    }
+  }
+
+  async function notifyDriverWaiting(driverUserId, order) {
+    const fresh = getOrder.get(order.id);
+    if (!fresh || fresh.driver_user_id !== driverUserId) return;
+
+    const current = getDriverCurrentOrder(driverUserId);
+    if (!current || fresh.id !== current.id) {
+      await sendDriverDm(
+        driverUserId,
+        current
+          ? msgDriverNotCurrentOrder(current.id, fresh.id)
+          : 'Сейчас нет активной поездки для «Ожидаю».',
+      );
+      return;
+    }
+    if (fresh.status !== ORDER_STATUS.CONFIRMED) {
+      await sendDriverDm(driverUserId, '«Ожидаю» доступно только в активной поездке после «Да, едем».');
+      return;
+    }
+    if (Number(fresh.driver_waiting_sent)) {
+      await sendDriverDm(
+        driverUserId,
+        `«Ожидаю» по заказу #${fresh.id} уже отправлено.`,
+      );
+      return;
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    setDriverWaitingSent.run(now, fresh.id);
+
+    const driver = getDriver.get(driverUserId);
+    await sendPeer(fresh.passenger_peer_id, msgPassengerDriverWaiting(fresh.id, driver?.callsign), {
+      keyboard: passengerDuringOrderKeyboard(),
+      random_id: randomId(),
+    });
+
+    syncDriverCurrentFocus(driverUserId);
+
+    const autoFinished = [];
+    if (config.simpleDriverFlow && listDriverActiveOrders.all(driverUserId).length <= 1) {
+      const toFinish = driverConfirmedOrders(driverUserId).filter((o) => o.id !== fresh.id);
+      for (const other of toFinish) {
+        await finishDriverOrder(other, driverUserId, { silent: true });
+        autoFinished.push(other.id);
+      }
+    }
+
+    await sendDriverDm(driverUserId, msgDriverWaitingSent(fresh.id, autoFinished), {
+      keyboard: driverTripKeyboardForUser(driverUserId),
+    });
   }
 
   async function replyHelpDriversChat(userId) {
     const { registered, callsign } = driverInfo(userId);
     await sendDriversChat(helpTextDriversChat(registered, callsign));
+  }
+
+  async function sendDriverTripsPanel(driverUserId, peerId = null) {
+    const orders = listDriverActiveOrders.all(driverUserId);
+    const current = getDriverCurrentOrder(driverUserId);
+    syncDriverCurrentFocus(driverUserId);
+    const outPeer = peerId || userPeerForSend(driverUserId);
+    const inline = driverTripsInlineKeyboard(
+      current?.status === ORDER_STATUS.CONFIRMED ? current : null,
+      !config.simpleDriverFlow && config.showDriverFinishButton,
+    );
+    const panelExtra = { random_id: randomId() };
+    if (inline) panelExtra.keyboard = inline;
+    await sendPeer(outPeer, msgDriverTripsPanel(orders, current?.id), panelExtra);
+    const hint =
+      current?.status === ORDER_STATUS.CONFIRMED
+        ? `Управление заказом #${current.id} — кнопками ниже.`
+        : current
+          ? `Сейчас в работе заказ #${current.id}. Дождитесь ответа пассажира.`
+          : 'Нет активных заказов.';
+    await sendPeer(outPeer, hint, {
+      keyboard: driverWorkKeyboard(driverUserId),
+      random_id: randomId(),
+    });
+  }
+
+  async function assignOrderToDriver(orderId, driverId, etaPhrase) {
+    const driver = getDriver.get(driverId);
+    if (!driver || driver.status !== DRIVER_STATUS.APPROVED) return 'driver';
+
+    const order = getOrder.get(orderId);
+    if (!order || order.status !== ORDER_STATUS.NEW) return 'unavailable';
+
+    const now = Math.floor(Date.now() / 1000);
+    const ok = takeOrder(orderId, driverId, etaPhrase, now);
+    if (!ok) return 'taken';
+
+    const fresh = getOrder.get(orderId);
+    const activeCount = listDriverActiveOrders.all(driverId).length - 1;
+
+    await sendPassengerOffer(fresh, passengerOfferEtaLine(driver.callsign, etaPhrase));
+
+    await editDriversOrderMessage(
+      fresh,
+      msgDriversChatTaken(fresh.id, driver.callsign, etaPhrase),
+      EMPTY_INLINE_KEYBOARD,
+    );
+
+    await sendDriverDm(
+      driverId,
+      msgDriverUseDmAfterTake(fresh.id, driver.callsign, etaPhrase, Math.max(0, activeCount)),
+    );
+    return 'ok';
   }
 
   async function replyHelpToUser(userId, peerId) {
@@ -587,7 +880,7 @@ export function createWebhookRouter(db) {
       console.warn('[order] не удалось обновить пост в беседе водителей:', e.message, e.vk);
     }
 
-    await sendIdleMenu(
+    await notifyPassengerAfterOrderClosed(
       fresh.passenger_peer_id,
       fresh.passenger_user_id,
       msgOrderCancelled(fresh.id),
@@ -778,12 +1071,11 @@ export function createWebhookRouter(db) {
       return;
     }
 
-    const driverOrder = activeOrderForDriver.get(userId);
-    if (driverOrder) {
+    if (driverHasActiveOrders(userId)) {
       await sendToPassenger(
         replyPeerId,
         userId,
-        'Нельзя выйти из водителей, пока у вас активный заказ. Сначала завершите поездку в личке с ботом («🏁 Завершить заказ»).',
+        'Нельзя выйти из водителей, пока есть активные заказы. Завершите поездки в личке с ботом.',
         null,
       );
       return;
@@ -886,7 +1178,7 @@ export function createWebhookRouter(db) {
       if (handled) return;
     }
 
-    const activeEarly = activeOrderForPassenger.get(fromId);
+    const activeEarly = getPrimaryPassengerOrder(fromId);
 
     if (uiAction === 'prices') {
       await sendPricesMessage(outPeer, fromId, activeEarly);
@@ -894,7 +1186,7 @@ export function createWebhookRouter(db) {
     }
 
     if (uiAction === 'repeat_order') {
-      if (activeEarly) {
+      if (activeEarly && !allowMultiPassengerOrders()) {
         await sendToPassenger(outPeer, fromId, msgActiveOrderBlocks('repeat_order'), activeEarly);
         return;
       }
@@ -919,7 +1211,6 @@ export function createWebhookRouter(db) {
       return;
     }
 
-    const driverOrderEarly = activeOrderForDriver.get(fromId);
     const orderDraft = getOrderDraft.get(fromId);
 
     if (uiAction === 'cancel_form') {
@@ -929,7 +1220,9 @@ export function createWebhookRouter(db) {
     }
 
     if (uiAction === 'cancel_search') {
-      const order = activeEarly;
+      const order = allowMultiPassengerOrders()
+        ? passengerLatestSearching(fromId)
+        : activeEarly;
       if (!order || order.status !== ORDER_STATUS.NEW) {
         await sendToPassenger(
           outPeer,
@@ -997,16 +1290,76 @@ export function createWebhookRouter(db) {
       return;
     }
 
-    if (uiAction === 'finish_order') {
-      if (!driverOrderEarly) {
-        await sendToPassenger(outPeer, fromId, 'Сейчас нет активной поездки для завершения.', null);
+    const dmSessionEarly = getSession.get(fromId);
+    if (
+      dmSessionEarly?.mode === 'driver_eta_custom' &&
+      text &&
+      !isMenuButtonText(text) &&
+      uiAction !== 'my_trips'
+    ) {
+      const orderId = dmSessionEarly.context_order_id;
+      const phrase = formatCustomEtaPhrase(text);
+      if (!phrase) {
+        await sendDriverDm(
+          fromId,
+          'Не понял время. Пример: 15, 25 мин, через 40 минут, к 18:30',
+        );
         return;
       }
-      await finishDriverOrder(driverOrderEarly, fromId);
+      upsertSession.run({ user_id: fromId, mode: 'idle', context_order_id: orderId });
+      const result = await assignOrderToDriver(orderId, fromId, phrase);
+      if (result === 'taken') {
+        await sendDriverDm(fromId, 'Заказ уже взял другой водитель.');
+      } else if (result === 'unavailable') {
+        await sendDriverDm(fromId, 'Заказ уже недоступен.');
+      }
+      return;
+    }
+
+    if (uiAction === 'my_trips') {
+      if (!driverHasActiveOrders(fromId) && !isApprovedDriver(fromId)) {
+        await sendToPassenger(outPeer, fromId, 'Раздел для водителей с активными заказами.', null);
+        return;
+      }
+      if (dmSessionEarly?.mode === 'driver_eta_custom') {
+        upsertSession.run({ user_id: fromId, mode: 'idle', context_order_id: null });
+      }
+      await sendDriverTripsPanel(fromId, outPeer);
+      return;
+    }
+
+    if (uiAction === 'waiting') {
+      const current = getDriverCurrentOrder(fromId);
+      if (!current || current.status !== ORDER_STATUS.CONFIRMED) {
+        await sendDriverDm(
+          fromId,
+          current
+            ? `Заказ #${current.id}: сначала дождитесь «Да, едем» от пассажира.`
+            : 'Сейчас нет активной поездки. «Ожидаю» — после подтверждения пассажиром.',
+        );
+        return;
+      }
+      await notifyDriverWaiting(fromId, current);
+      return;
+    }
+
+    if (uiAction === 'finish_order') {
+      const current = getDriverCurrentOrder(fromId);
+      if (!current || current.status !== ORDER_STATUS.CONFIRMED) {
+        await sendDriverDm(
+          fromId,
+          current
+            ? `Заказ #${current.id}: завершить можно после «Да, едем» от пассажира.`
+            : 'Сейчас нет активной поездки для завершения.',
+        );
+        return;
+      }
+      await finishDriverOrder(current, fromId);
       return;
     }
 
     if (
+      !allowMultiPassengerOrders() &&
       activeEarly &&
       (uiAction === 'order' ||
         uiAction === 'repeat_order' ||
@@ -1076,41 +1429,62 @@ export function createWebhookRouter(db) {
 
     const dmSession = getSession.get(fromId);
 
+    const driverCurrentEarly = getDriverCurrentOrder(fromId);
     if (
-      driverOrderEarly &&
-      driverOrderEarly.status === ORDER_STATUS.CONFIRMED &&
+      driverCurrentEarly?.status === ORDER_STATUS.CONFIRMED &&
       text &&
       !isMenuButtonText(text) &&
       !(activeEarly && activeEarly.passenger_user_id === fromId)
     ) {
-      await sendPeer(driverOrderEarly.passenger_peer_id, `Водитель:\n${text}`, {
+      const { orderId, body } = parseDriverRelayText(text);
+      if (!body) {
+        await sendDriverDm(
+          fromId,
+          orderId
+            ? `Сейчас в работе заказ #${driverCurrentEarly.id}. Сообщения для #${orderId} — после него.`
+            : 'Напишите текст для пассажира текущего заказа.',
+        );
+        return;
+      }
+      const target = resolveDriverRelayOrder(fromId, orderId, body);
+      if (!target) {
+        const current = getDriverCurrentOrder(fromId);
+        await sendDriverDm(
+          fromId,
+          orderId && current
+            ? msgDriverNotCurrentOrder(current.id, orderId)
+            : 'Нет активной поездки для сообщения.',
+        );
+        return;
+      }
+      syncDriverCurrentFocus(fromId);
+      await sendPeer(target.passenger_peer_id, `Водитель (заказ #${target.id}):\n${body}`, {
         keyboard: passengerDuringOrderKeyboard(),
+        random_id: randomId(),
       });
       return;
     }
 
-    if (
-      driverOrderEarly &&
-      driverOrderEarly.status === ORDER_STATUS.PENDING &&
-      text &&
-      !isMenuButtonText(text)
-    ) {
+    if (driverHasActiveOrders(fromId) && text && !isMenuButtonText(text)) {
+      const current = getDriverCurrentOrder(fromId);
       await sendDriverDm(
         fromId,
-        'Ожидайте подтверждения «Да, едем» от пассажира. Переписка откроется после подтверждения.',
-        { keyboard: driverPendingKeyboard() },
+        current
+          ? `Заказ #${current.id}: ожидайте «Да, едем» от пассажира. Остальные в очереди — после него.`
+          : 'Ожидайте подтверждения «Да, едем» от пассажира.',
+        { keyboard: driverWorkKeyboard(fromId) },
       );
       return;
     }
 
     const regSession = dmSession;
     if (regSession?.mode === 'register_callsign' && text && !isMenuButtonText(text)) {
-      if (activeEarly) {
+      if (passengerHasActiveOrders(fromId)) {
         await sendToPassenger(
           outPeer,
           fromId,
           msgActiveOrderBlocks('driver'),
-          activeEarly,
+          getPrimaryPassengerOrder(fromId),
         );
         clearSession.run(fromId);
         return;
@@ -1129,7 +1503,7 @@ export function createWebhookRouter(db) {
         );
         return;
       }
-      if (activeEarly) {
+      if (activeEarly && !allowMultiPassengerOrders()) {
         await sendToPassenger(
           outPeer,
           fromId,
@@ -1142,8 +1516,37 @@ export function createWebhookRouter(db) {
       return;
     }
 
-    const active = activeEarly ?? activeOrderForPassenger.get(fromId);
-    if (active) {
+    if (allowMultiPassengerOrders() && passengerHasActiveOrders(fromId) && text && !isMenuButtonText(text)) {
+      const { orderId, body } = parseDriverRelayText(text);
+      const target = resolvePassengerRelayOrder(fromId, orderId, body);
+      if (target) {
+        setPassengerFocus(fromId, target.id);
+        await sendDriverDm(
+          target.driver_user_id,
+          `Заказ #${target.id} — пассажир:\n${body}`,
+        );
+        await sendToPassenger(
+          outPeer,
+          fromId,
+          `✓ Сообщение по заказу #${target.id} отправлено водителю.`,
+          target,
+        );
+        return;
+      }
+      const pending = passengerActiveOrders(fromId).filter((o) => o.status === ORDER_STATUS.PENDING);
+      if (pending.length) {
+        await sendToPassenger(
+          outPeer,
+          fromId,
+          'Есть заказы без ответа — нажмите «Да, едем» или «Отмена» под предложением водителя.',
+          getPrimaryPassengerOrder(fromId),
+        );
+        return;
+      }
+    }
+
+    const active = getPrimaryPassengerOrder(fromId);
+    if (active && !allowMultiPassengerOrders()) {
       if (isMenuButtonText(text)) {
         if (uiAction === 'prices') {
           await sendPricesMessage(outPeer, fromId, active);
@@ -1157,6 +1560,7 @@ export function createWebhookRouter(db) {
       }
 
       if (active.status === ORDER_STATUS.CONFIRMED && active.driver_user_id) {
+        setPassengerFocus(fromId, active.id);
         await sendDriverDm(
           active.driver_user_id,
           `Заказ #${active.id} — пассажир:\n${text || '(без текста)'}`,
@@ -1199,6 +1603,16 @@ export function createWebhookRouter(db) {
           '🔍 Ищем водителя. Как только кто-то ответит — пришлём сюда. Или «❌ Отменить поиск».',
           active,
         );
+        return;
+      }
+    }
+
+    if (allowMultiPassengerOrders() && passengerHasActiveOrders(fromId) && isMenuButtonText(text)) {
+      if (uiAction === 'help') {
+        await replyHelpCommunity(outPeer, fromId);
+        return;
+      }
+      if (uiAction === 'order' || uiAction === 'repeat_order' || uiAction === 'cancel_search') {
         return;
       }
     }
@@ -1254,43 +1668,125 @@ export function createWebhookRouter(db) {
       return;
     }
 
-    const order = getOrder.get(orderId);
-    if (!order || order.status !== 'new') {
-      await answerCallbackError(ev, 'Заказ недоступен');
-      return;
-    }
-
-    const etaKey = kind === '20' ? 20 : kind === '10' ? 10 : 3;
-    const etaPhrase = ETA_TEXT[etaKey];
+    const etaPhrase = etaPhraseFromPreset(kind === '20' ? 20 : kind === '10' ? 10 : 3);
     if (!etaPhrase) {
       await answerCallbackError(ev, 'Неизвестный вариант');
       return;
     }
 
-    const now = Math.floor(Date.now() / 1000);
-    const ok = takeOrder(orderId, driverId, now);
-    if (!ok) {
+    const result = await assignOrderToDriver(orderId, driverId, etaPhrase);
+    if (result === 'taken') {
       await answerCallbackError(ev, 'Заказ уже взят');
+      return;
+    }
+    if (result === 'unavailable') {
+      await answerCallbackError(ev, 'Заказ недоступен');
+      return;
+    }
+    if (result === 'driver') {
+      await answerCallbackError(ev, 'Вы не одобрены как водитель');
       return;
     }
 
     await answerCallbackEvent(ev);
+  }
 
-    const fresh = getOrder.get(orderId);
-    await sendPassengerOffer(
-      fresh,
-      `Водитель (${driver.callsign}) будет у вас ${etaPhrase}.`,
-    );
+  async function handleEtaCustomPress(ev, payload) {
+    const orderId = Number(payload.o);
+    const driverId = ev.user_id;
 
-    await editDriversOrderMessage(
-      fresh,
-      msgDriversChatTaken(fresh.id, driver.callsign),
-      EMPTY_INLINE_KEYBOARD,
-    );
+    const driver = getDriver.get(driverId);
+    if (!driver) {
+      await answerCallbackError(ev, 'Сначала: ЛС → «🚗 Я водитель»');
+      return;
+    }
+    if (driver.status !== DRIVER_STATUS.APPROVED) {
+      await answerCallbackError(ev, 'Нет доступа водителя');
+      return;
+    }
 
-    await sendDriverDm(driverId, msgDriverUseDmAfterTake(fresh.id, driver.callsign), {
-      keyboard: driverPendingKeyboard(),
+    const order = getOrder.get(orderId);
+    if (!order || order.status !== ORDER_STATUS.NEW) {
+      await answerCallbackError(ev, 'Заказ недоступен');
+      return;
+    }
+
+    await answerCallbackEvent(ev, 'Напишите время в ЛС боту');
+
+    upsertSession.run({
+      user_id: driverId,
+      mode: 'driver_eta_custom',
+      context_order_id: orderId,
     });
+
+    await sendPeer(userPeerForSend(driverId), msgDriverCustomEtaPrompt(orderId), {
+      keyboard: driverWorkKeyboard(driverId),
+      random_id: randomId(),
+    });
+  }
+
+  async function handleDriverTripCallback(ev, payload) {
+    const driverId = ev.user_id;
+    const orderId = Number(payload.o);
+    const action = String(payload.a || '');
+
+    if (action === 'noop') {
+      await answerCallbackEvent(ev);
+      return;
+    }
+
+    const order = getOrder.get(orderId);
+    if (!order || order.driver_user_id !== driverId) {
+      await answerCallbackError(ev, 'Не ваш заказ');
+      return;
+    }
+
+    if (action === 'df') {
+      const current = getDriverCurrentOrder(driverId);
+      await answerCallbackError(
+        ev,
+        current
+          ? `Сейчас #${current.id}. Заказ #${orderId} в очереди.`
+          : 'Заказ не в работе',
+      );
+      return;
+    }
+
+    if (action === 'dw') {
+      if (!isDriverCurrentOrder(driverId, orderId)) {
+        const current = getDriverCurrentOrder(driverId);
+        await answerCallbackError(
+          ev,
+          current ? `Сначала #${current.id}` : 'Не ваш текущий заказ',
+        );
+        return;
+      }
+      if (order.status !== ORDER_STATUS.CONFIRMED) {
+        await answerCallbackError(ev, 'Только в поездке');
+        return;
+      }
+      await answerCallbackEvent(ev);
+      await notifyDriverWaiting(driverId, order);
+      return;
+    }
+
+    if (action === 'dfin') {
+      if (!isDriverCurrentOrder(driverId, orderId)) {
+        const current = getDriverCurrentOrder(driverId);
+        await answerCallbackError(
+          ev,
+          current ? `Сначала #${current.id}` : 'Не ваш текущий заказ',
+        );
+        return;
+      }
+      if (order.status !== ORDER_STATUS.CONFIRMED) {
+        await answerCallbackError(ev, 'Только в поездке');
+        return;
+      }
+      await answerCallbackEvent(ev, `Завершён #${orderId}`);
+      await finishDriverOrder(order, driverId);
+      return;
+    }
   }
 
   async function handlePassengerDecision(ev, payload) {
@@ -1324,7 +1820,8 @@ export function createWebhookRouter(db) {
       setOrderConfirmed.run(now, orderId);
       const confirmed = getOrder.get(orderId);
       const driver = getDriver.get(driverId);
-      clearSession.run(driverId);
+      syncDriverCurrentFocus(driverId);
+      setPassengerFocus(confirmed.passenger_user_id, orderId);
 
       await editDriversOrderMessage(
         confirmed,
@@ -1338,10 +1835,11 @@ export function createWebhookRouter(db) {
         msgOrderTrip(orderId, driver?.callsign),
         confirmed,
       );
+      const current = getDriverCurrentOrder(driverId);
       await sendDriverDm(
         driverId,
-        msgDriverTripDm(orderId, driver?.callsign ?? 'водитель'),
-        { keyboard: driverTripKeyboard() },
+        msgDriverTripDm(orderId, driver?.callsign ?? 'водитель', current?.id ?? orderId),
+        { keyboard: driverTripKeyboardForUser(driverId) },
       );
       return;
     }
@@ -1351,16 +1849,15 @@ export function createWebhookRouter(db) {
 
       const now = Math.floor(Date.now() / 1000);
       setOrderCancelled.run(now, orderId);
-      await sendIdleMenu(
+      await notifyPassengerAfterOrderClosed(
         order.passenger_peer_id,
         order.passenger_user_id,
         msgOrderCancelled(orderId),
       );
-      clearSession.run(driverId);
-      await sendDriverDm(
-        driverId,
-        `Пассажир отменил заказ #${orderId}.`,
-      );
+      if (!driverHasActiveOrders(driverId)) {
+        clearSession.run(driverId);
+      }
+      await sendDriverDm(driverId, `Пассажир отменил заказ #${orderId}.`);
     }
   }
 
@@ -1379,6 +1876,14 @@ export function createWebhookRouter(db) {
 
     if (payload.a === 'eta') {
       await handleEtaPress(ev, payload);
+      return;
+    }
+    if (payload.a === 'eta_custom') {
+      await handleEtaCustomPress(ev, payload);
+      return;
+    }
+    if (payload.a === 'df' || payload.a === 'dw' || payload.a === 'dfin' || payload.a === 'noop') {
+      await handleDriverTripCallback(ev, payload);
       return;
     }
     if (

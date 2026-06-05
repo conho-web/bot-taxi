@@ -9,6 +9,8 @@ export const BTN = {
   LOGOUT_DRIVER: '🚪 Выйти из водителей',
   HELP: '❓ Помощь',
   ADMIN: '⚙️ Админ',
+  WAITING: '⏳ Ожидаю',
+  MY_TRIPS: '📋 Мои поездки',
   FINISH_ORDER: '🏁 Завершить заказ',
   CANCEL_FORM: '❌ Отменить',
   CANCEL_SEARCH: '❌ Отменить поиск',
@@ -60,6 +62,10 @@ export function uiActionFromMessage(text, payloadRaw) {
   if (t === BTN.PROFILE) return 'profile';
   if (t === BTN.EDIT_DRIVER) return 'edit_driver';
   if (t === BTN.LOGOUT_DRIVER) return 'logout_driver';
+  if (/^⏳ Ожидаю #\d+$/.test(t)) return 'waiting';
+  if (/^🏁 Завершить #\d+$/.test(t)) return 'finish_order';
+  if (t === BTN.WAITING) return 'waiting';
+  if (t === BTN.MY_TRIPS) return 'my_trips';
   if (t === BTN.FINISH_ORDER) return 'finish_order';
   if (t === BTN.CANCEL_FORM) return 'cancel_form';
   if (t === BTN.CANCEL_SEARCH) return 'cancel_search';
@@ -132,9 +138,10 @@ export function msgOrderCancelled(orderId) {
   ].join('\n');
 }
 
-export function msgDriversChatTaken(orderId, callsign) {
+export function msgDriversChatTaken(orderId, callsign, etaPhrase = null) {
+  const eta = etaPhrase ? `\n⏱ ${etaPhrase}` : '';
   return (
-    `🚕 Заказ #${orderId} — взял ${callsign}\n\n` +
+    `🚕 Заказ #${orderId} — взял ${callsign}${eta}\n\n` +
     `Переписка с пассажиром — только в личных сообщениях бота (не в этой беседе).`
   );
 }
@@ -143,26 +150,148 @@ export function msgDriversChatPassengerCancelled(orderId) {
   return `🚕 Заказ #${orderId}\n\n❌ Пассажир отменил заказ.`;
 }
 
-export function msgDriverUseDmAfterTake(orderId, callsign) {
-  return [
+export function msgDriverUseDmAfterTake(orderId, callsign, etaPhrase, activeCount = 0) {
+  const lines = [
     `Вы взяли заказ #${orderId} (${callsign}).`,
+    `Пассажиру: ${etaPhrase}`,
     '',
-    'Дальнейшая переписка с пассажиром — только здесь, в личных сообщениях бота.',
-    'В беседе водителей новые сообщения пассажиру не уходят.',
+    'Ожидайте «Да, едем» от пассажира.',
+    'Можно брать другие заказы в беседе — они встанут в очередь после текущего.',
+  ];
+  if (activeCount > 0) {
+    lines.push(
+      '',
+      `📋 Всего активных: ${activeCount + 1}. Сейчас в работе — самый ранний. «📋 Мои поездки» — очередь.`,
+    );
+  }
+  return lines.join('\n');
+}
+
+export function msgDriverCustomEtaPrompt(orderId) {
+  return [
+    `✏️ Заказ #${orderId} — своё время подачи`,
     '',
-    'Ожидайте подтверждения «Да, едем» от пассажира.',
+    'Напишите одним сообщением в этот диалог:',
+    '• число минут: 15, 25, 40',
+    '• или текст: через полчаса, к 18:30',
+    '',
+    'Отмена: «📋 Мои поездки» или «❓ Помощь»',
   ].join('\n');
 }
 
-export function msgDriverTripDm(orderId, callsign) {
+export function msgDriverTripDm(orderId, callsign, currentOrderId = orderId) {
+  if (orderId !== currentOrderId) {
+    return [
+      `✅ Пассажир подтвердил заказ #${orderId}.`,
+      '',
+      `Сейчас в работе заказ #${currentOrderId} — сначала завершите его.`,
+      `#${orderId} в очереди. «📋 Мои поездки» — статус.`,
+      '',
+      `Позывной: ${callsign}`,
+    ].join('\n');
+  }
   return [
     `🚕 Поездка по заказу #${orderId}`,
     '',
-    `Пассажир подтвердил. Пишите ему здесь, в личке с ботом.`,
-    `Когда поездка закончена — «🏁 Завершить заказ».`,
+    'Пассажир подтвердил. Пишите пассажиру здесь (просто текст).',
+    `«⏳ Ожидаю #${orderId}» — вы на месте (один раз).`,
+    `«🏁 Завершить #${orderId}» — закрыть поездку.`,
+    'Новые заказы в беседе — встанут в очередь после текущего.',
+    '«📋 Мои поездки» — очередь и кнопки управления.',
     '',
     `Позывной: ${callsign}`,
   ].join('\n');
+}
+
+export function msgDriverTripsPanel(orders, currentId) {
+  const lines = ['📋 Мои поездки', ''];
+  if (!orders.length) {
+    lines.push('Нет активных заказов. Новые — в беседе водителей.');
+    return lines.join('\n');
+  }
+
+  const current = orders.find((o) => o.id === currentId) || orders[0];
+  const queued = orders.filter((o) => o.id !== current.id);
+
+  lines.push(`🔵 Сейчас: заказ #${current.id}`);
+  if (current.status === ORDER_STATUS.CONFIRMED) {
+    lines.push(
+      Number(current.driver_waiting_sent)
+        ? '   Поездка · «Ожидаю» уже отправлено'
+        : '   Поездка · можно отправить «Ожидаю»',
+    );
+  } else {
+    lines.push(
+      `   Ждём «Да, едем» от пассажира${current.eta_phrase ? ` · ${current.eta_phrase}` : ''}`,
+    );
+  }
+
+  if (queued.length) {
+    lines.push('', `🔒 В очереди (после #${current.id}):`);
+    for (const o of queued) {
+      let status = '';
+      if (o.status === ORDER_STATUS.CONFIRMED) {
+        status = 'поездка подтверждена';
+      } else {
+        status = `ждём пассажира${o.eta_phrase ? ` · ${o.eta_phrase}` : ''}`;
+      }
+      lines.push(`   #${o.id} — ${status}`);
+    }
+    lines.push('', `Следующий заказ откроется после завершения #${current.id}.`);
+  }
+
+  if (current.status === ORDER_STATUS.CONFIRMED) {
+    lines.push(
+      '',
+      `Кнопки ниже — только для заказа #${current.id}.`,
+      'Сообщение пассажиру: просто текст в этот диалог.',
+    );
+  } else {
+    lines.push(
+      '',
+      'Управление поездкой откроется после «Да, едем» по текущему заказу.',
+      'Новые заказы в беседе (~3-5 / ~10 / ~20 / Своё время) — попадут в очередь.',
+    );
+  }
+  return lines.join('\n');
+}
+
+export function msgDriverNotCurrentOrder(currentId, actionOrderId) {
+  return [
+    `Сейчас в работе заказ #${currentId}.`,
+    `Заказ #${actionOrderId} в очереди — сначала завершите текущий.`,
+    '«📋 Мои поездки» — статус очереди.',
+  ].join('\n');
+}
+
+export function msgDriverOrderFinishedNext(finishedId, nextId, queueSize) {
+  const lines = [
+    `✅ Заказ #${finishedId} завершён.`,
+    '',
+    `🔵 Сейчас в работе: заказ #${nextId}.`,
+  ];
+  if (queueSize > 1) {
+    lines.push(`В очереди ещё ${queueSize - 1}. «📋 Мои поездки» — список.`);
+  }
+  return lines.join('\n');
+}
+
+export function msgPassengerDriverWaiting(orderId, callsign) {
+  const who = callsign ? `«${callsign}»` : 'Водитель';
+  return [
+    `🆔 Заказ #${orderId}`,
+    '',
+    `⏳ ${who} на месте и ожидает вас.`,
+    'Выходите к машине, при необходимости напишите в этот диалог.',
+  ].join('\n');
+}
+
+export function msgDriverWaitingSent(orderId, autoFinishedIds = []) {
+  const lines = [`✓ Пассажиру заказа #${orderId} отправлено «Ожидаю».`];
+  if (autoFinishedIds.length) {
+    lines.push('', `Завершены предыдущие: ${autoFinishedIds.map((id) => `#${id}`).join(', ')}`);
+  }
+  return lines.join('\n');
 }
 
 export function msgDriverFinishOrder(orderId) {
@@ -300,10 +429,12 @@ export function helpTextDriversChat(isRegisteredDriver, callsign) {
   const lines = [
     '🚕 Беседа водителей',
     '',
-    '• Новый заказ — кнопки «~ 3-5 мин», «~ 10 мин», «~ 20 мин».',
-    '• После взятия заказа здесь только обновится статус — кто взял.',
-    '• Переписка с пассажиром — в личных сообщениях бота.',
-    '• Завершить поездку водитель может только в личке с ботом.',
+    '• Новый заказ — ~3-5 / ~10 / ~20 мин или «Своё время».',
+    '• Можно брать несколько заказов — они встают в очередь.',
+    '• Сначала всегда текущий (самый ранний), остальные ждут.',
+    '• После взятия здесь только обновится статус — кто взял.',
+    '• Переписка и «Ожидаю» / «Завершить» — в личке с ботом.',
+    '• «📋 Мои поездки» — очередь и кнопки для текущего заказа.',
   ];
 
   if (isRegisteredDriver) {
