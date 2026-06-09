@@ -75,8 +75,9 @@ import {
 
 /**
  * @param {import('better-sqlite3').Database} db
+ * @returns {(update: { type?: string, object?: unknown }) => Promise<void>}
  */
-export function createWebhookRouter(db) {
+export function createBot(db) {
   const getDriver = db.prepare('SELECT * FROM drivers WHERE user_id = ?');
   const insertDriverPending = db.prepare(`
     INSERT INTO drivers (user_id, callsign, created_at, status)
@@ -1907,56 +1908,25 @@ export function createWebhookRouter(db) {
     }
   }
 
-  /**
-   * Express handler
-   */
-  return async function webhook(req, res) {
-    const body = req.body || {};
-    const secretOk =
-      !config.vkCallbackSecret ||
-      String(body.secret ?? '') === String(config.vkCallbackSecret);
+  const silentTypes = new Set([
+    'message_typing_state',
+    'message_read',
+    'message_reply',
+    'user_block',
+    'user_unblock',
+  ]);
 
-    console.log('[VK webhook]', {
-      type: body.type,
-      group_id: body.group_id,
-      secret_ok: secretOk,
-    });
+  return async function processUpdate(body) {
+    const { type } = body || {};
 
-    if (!secretOk) {
-      console.warn(
-        '[VK webhook] 403: секрет Callback не совпал. Сверь VK_CALLBACK_SECRET в .env с полем в настройках Callback API.',
-      );
-      res.status(403).send('forbidden');
-      return;
+    console.log('[VK update]', { type });
+
+    if (type === 'message_new') {
+      await handleMessageNew(body);
+    } else if (type === 'message_event') {
+      await handleMessageEvent(body);
+    } else if (type && !silentTypes.has(type)) {
+      console.log('[VK update] событие без обработчика:', type);
     }
-
-    const { type } = body;
-
-    if (type === 'confirmation') {
-      res.status(200).type('text/plain').send(config.vkConfirmation);
-      return;
-    }
-
-    const silentTypes = new Set([
-      'message_typing_state',
-      'message_read',
-      'message_reply',
-      'user_block',
-      'user_unblock',
-    ]);
-
-    try {
-      if (type === 'message_new') {
-        await handleMessageNew(body);
-      } else if (type === 'message_event') {
-        await handleMessageEvent(body);
-      } else if (type && !silentTypes.has(type)) {
-        console.log('[VK webhook] событие без обработчика:', type);
-      }
-    } catch (e) {
-      console.error('Webhook error:', e);
-    }
-
-    res.status(200).type('text/plain').send('ok');
   };
 }

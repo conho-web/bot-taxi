@@ -16,9 +16,9 @@ function parseAdminIds(raw) {
 
 export const config = {
   vkGroupToken: required('VK_GROUP_TOKEN'),
-  vkConfirmation: required('VK_CONFIRMATION'),
-  vkCallbackSecret: process.env.VK_CALLBACK_SECRET || '',
   vkGroupId: Number(required('VK_GROUP_ID')),
+  /** Секунды ожидания в long poll (макс. 90) */
+  longPollWait: Math.min(90, Math.max(1, Number(process.env.LONG_POLL_WAIT || 25))),
   driversPeerId: Number(required('DRIVERS_PEER_ID')),
   /** Ссылка vk.me/join/… если API не выдал invite (опционально) */
   driversChatInviteLink: (process.env.DRIVERS_CHAT_INVITE_LINK || '').trim(),
